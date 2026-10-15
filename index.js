@@ -5,7 +5,7 @@
 // 預設 DRY_RUN=1：只在 log 顯示「準備要做什麼」，不會真的寫入 CRM。
 const http = require('http');
 
-const VERSION = 'v3-phone-as-name';   // 首頁會顯示，用來確認 Render 跑的是哪一版
+const VERSION = 'v4-ext-search-fallback';   // 首頁會顯示，用來確認 Render 跑的是哪一版
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';       // 網址 ?token= 要一致
 const BIZFORM_TOKEN = process.env.BIZFORM_TOKEN || '';       // 選填：BizForm 標頭 x-bizform-token 的值
@@ -107,11 +107,36 @@ async function searchCustomers(criteria) {
   const arr = Array.isArray(j) ? j : (j?.data ?? j?.Data ?? []);
   return Array.isArray(arr) ? arr : [];
 }
+// 依「擴充欄位」查客戶。文件寫「字串」，但實際 CRM 回 400，所以依序嘗試幾種格式，找到能用的就記住；
+// 全部被拒絕時不丟錯，回傳空陣列，讓流程改用電話比對。
+const EXT_FORMATS = [
+  (k, v) => ({ [k]: v }),
+  (k, v) => [v],
+  (k, v) => [{ Key: k, Value: v }],
+  (k, v) => [{ Name: k, Value: v }],
+];
+let extFmt = -1; // -1 尚未確定；>=0 已確定可用的格式；-2 全部被拒絕
+async function searchByExtended(key, value) {
+  if (extFmt === -2) return [];
+  const order = extFmt >= 0 ? [extFmt] : EXT_FORMATS.map((_, i) => i);
+  for (const i of order) {
+    try {
+      const r = await searchCustomers({ ExtendedField: EXT_FORMATS[i](key, value) });
+      if (extFmt < 0) { extFmt = i; console.log('[info] ExtendedField 查詢格式可用，編號', i); }
+      return r;
+    } catch (e) {
+      if (!/-> 400/.test(e.message)) throw e;
+    }
+  }
+  if (extFmt < 0) extFmt = -2;
+  console.warn('[warn] ExtendedField 查詢格式都被 CRM 拒絕，改用電話比對');
+  return [];
+}
 // 找同一個人：先用身分證，再用電話；電話相同但身分證不同 → 視為不同人，不合併
 async function findCustomer(p) {
   const noOf = (h) => h && (h.CustomerNo ?? h.customerNo);
   if (p.idNumber) {
-    const hits = (await searchCustomers({ ExtendedField: p.idNumber })).filter(x => deepHas(x, p.idNumber));
+    const hits = (await searchByExtended(CRM_EXT_ID_KEY, p.idNumber)).filter(x => deepHas(x, p.idNumber));
     if (hits.length > 1) console.warn('[warn] 身分證對到多位客戶，使用第一位', hits.length);
     if (hits[0]) return noOf(hits[0]);
   }
@@ -119,7 +144,8 @@ async function findCustomer(p) {
     const byTel = (await searchCustomers({ TelecomNum: p.phone })).filter(x => deepHas(x, p.phone));
     const byName = (await searchCustomers({ CurrentName: p.phone })).filter(x => (x.CurrentName ?? x.currentName) === p.phone); // 舊資料：姓名欄放手機
     const sameOrUnknown = (x) => !p.idNumber || (JSON.stringify(x).match(ID_RE) || []).every(id => id === p.idNumber);
-    const cand = [...byTel, ...byName].filter(sameOrUnknown);
+    const seen = new Set();
+    const cand = [...byTel, ...byName].filter(sameOrUnknown).filter(x => { const n = noOf(x); if (seen.has(n)) return false; seen.add(n); return true; });
     if (cand.length > 1) console.warn('[warn] 電話對到多位客戶，使用第一位', cand.length);
     if (cand[0]) return noOf(cand[0]);
   }
