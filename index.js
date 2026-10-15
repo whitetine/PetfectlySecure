@@ -5,7 +5,7 @@
 // 預設 DRY_RUN=1：只在 log 顯示「準備要做什麼」，不會真的寫入 CRM。
 const http = require('http');
 
-const VERSION = 'v4-ext-search-fallback';   // 首頁會顯示，用來確認 Render 跑的是哪一版
+const VERSION = 'v5-orders';   // 首頁會顯示，用來確認 Render 跑的是哪一版
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';       // 網址 ?token= 要一致
 const BIZFORM_TOKEN = process.env.BIZFORM_TOKEN || '';       // 選填：BizForm 標頭 x-bizform-token 的值
@@ -14,6 +14,9 @@ const CRM_API_KEY = process.env.CRM_API_KEY || '';
 const CRM_BASE = process.env.CRM_BASE || 'https://crm-storeapi.vitalyun.com';
 const DRY_RUN = process.env.DRY_RUN !== '0';                 // 只有明確設成 0 才會真的寫入
 const DEBUG = process.env.DEBUG === '1';                     // 開啟 /debug/last（含個資，測完請關閉）
+const ORDERS = process.env.ORDERS === '1';                   // 設成 1 才會建立「消費」（預設關閉）
+const ORDER_TYPE = process.env.ORDER_TYPE || '';             // 選填：消費類別（必須已存在於 CRM）
+const ORDER_STATUS = process.env.ORDER_STATUS || '';         // 選填：消費狀態（必須已存在於 CRM）
 const FORM_IDS = (process.env.FORM_IDS || '').split(',').map(s => s.trim()).filter(Boolean); // 選填：只處理這些 formId
 
 // 表單欄位名稱（displayName）對應；之後欄位改名只要改這裡
@@ -74,6 +77,50 @@ function buildNote(body, p) {
   }
   lines.push('', `<!-- BizForm ${body.depotId}:${body.formId}:${body.documentId}:v${body.version} -->`);
   return lines.join('\n');
+}
+
+// ---- 每份表單 → CRM 一筆「消費」 ----
+const SERVICE_GROUPS = ['洗澡', '剪毛', '大美容', '小美容', '其他1', '其他2', '其他3', '其他4', '其他5'];
+const num = (s) => { const n = parseFloat(String(s ?? '').replace(/[^\d.]/g, '')); return Number.isFinite(n) ? n : NaN; };
+const taipeiDate = (iso) => { const d = new Date(iso); if (isNaN(d)) return ''; return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d).replace(/-/g, '/'); };
+
+function buildOrder(body, p, customerNo) {
+  const get = (l) => pick(p.fields, l);
+  const products = [];
+  for (const g of SERVICE_GROUPS) {
+    const desc = get(`服務內容(${g})`), price = num(get(`單價(${g})`)), times = num(get(`次數(${g})`)), period = get(`期間(${g})`);
+    if (!desc && isNaN(price) && isNaN(times)) continue;
+    products.push({
+      ProductName: g.startsWith('其他') && desc ? desc.slice(0, 50) : g,
+      Quantity: isNaN(times) || times <= 0 ? 1 : times,
+      UnitPrice: isNaN(price) ? 0 : price,
+      ItemDesc: [desc, period && `期間：${period}`].filter(Boolean).join('；'),
+    });
+  }
+  // CRM 規定消費至少要有一筆產品；沒有服務項目的表單（例如契約）放一筆 0 元的代表項目
+  if (!products.length) products.push({ ProductName: norm(body.formDisplayName), Quantity: 1, UnitPrice: 0 });
+  // 擴充欄位：用「表單欄位名稱」當名稱；CRM「消費」擴充欄位有建同名的才會被填入，沒建的 CRM 會自動忽略
+  const skip = new Set(Object.values(F).flat());
+  const ext = {};
+  for (const f of p.fields) {
+    if (!f.value || f.readOnly || skip.has(f.label)) continue;
+    if (/^(服務內容|單價|次數|總費用|期間)\(/.test(f.label)) continue;
+    ext[f.label] = f.value;
+  }
+  ext['表單名稱'] = norm(body.formDisplayName);
+  ext['表單單號'] = `#${body.documentId}`;
+  ext['原始表單'] = body.documentUrl;
+  const o = {
+    OrderNo: `BF-${body.formId}-${body.documentId}`,   // 同一份表單重送只會更新、不會重複
+    CustomerType: 'PersonAccount',
+    CustomerNo: customerNo,
+    OrderDate: taipeiDate(body.creationTime),
+    Products: products,
+    ExtendedField: ext,
+  };
+  if (ORDER_TYPE) o.Type = ORDER_TYPE;
+  if (ORDER_STATUS) o.OrderStatusName = ORDER_STATUS;
+  return o;
 }
 
 function customerBody(p, isNew) {
@@ -159,6 +206,7 @@ async function handleDocument(body) {
   if (!p.idNumber && !p.phone) return { key, skipped: '表單沒有身分證字號也沒有有效電話，無法辨識客戶' };
   const note = buildNote(body, p);
   const plan = { key, idNumber: p.idNumber, phone: p.phone, customerCreate: customerBody(p, true), customerMerge: customerBody(p, false), note };
+  if (ORDERS) plan.order = buildOrder(body, p, '(客戶編號)');
   if (DRY_RUN) return { ...plan, dryRun: true };
 
   let no = await findCustomer(p);
@@ -172,8 +220,13 @@ async function handleDocument(body) {
     action = 'created';
   }
   await crm('POST', 'notes', { CustomerNo: no, Content: note, IsPublic: false, IsMarkdown: true });
+  let order = 'off';
+  if (ORDERS) {
+    try { await crm('POST', 'orders', buildOrder(body, p, no)); order = 'created'; }
+    catch (e) { order = 'failed'; console.error('[error-order]', e.message); }   // 消費失敗不影響客戶與記事
+  }
   done.add(key);
-  return { key, customerNo: no, customer: action, note: 'created' };
+  return { key, customerNo: no, customer: action, note: 'created', order };
 }
 
 const server = http.createServer(async (req, res) => {
