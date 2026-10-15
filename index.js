@@ -5,7 +5,7 @@
 // 預設 DRY_RUN=1：只在 log 顯示「準備要做什麼」，不會真的寫入 CRM。
 const http = require('http');
 
-const VERSION = 'v5-orders';   // 首頁會顯示，用來確認 Render 跑的是哪一版
+const VERSION = 'v6-orders-fields';   // 首頁會顯示，用來確認 Render 跑的是哪一版
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';       // 網址 ?token= 要一致
 const BIZFORM_TOKEN = process.env.BIZFORM_TOKEN || '';       // 選填：BizForm 標頭 x-bizform-token 的值
@@ -229,6 +229,25 @@ async function handleDocument(body) {
   return { key, customerNo: no, customer: action, note: 'created', order };
 }
 
+// ---- 一次性：在 CRM 建立「訂單」擴充欄位（只新增欄位，不動任何資料）----
+// 欄位名稱 = 表單欄位名稱（過長的契約條文、服務項目、身分欄位不建）。已存在的會被 CRM 拒絕(400)，視為「已存在」。
+const BASE_ORDER_FIELDS = ["姓名", "國民身分證統一編號/居留證號碼", "電話(甲方)", "緊急聯絡人", "緊急聯絡人電話", "通訊地址", "是否為飼主本人", "與飼主關係", "公司/商號名稱", "代表人/負責人姓名", "營業時間", "電話(乙方)", "營業地址", "寵物名", "性別(公、母)", "犬、貓年齡", "犬、貓品種", "種類(貓、狗)", "絕育(有、無)", "晶片號碼", "犬、貓個性傾向(其他)", "外觀", "異常狀況", "其他", "病史(其他)", "金額(新臺幣)", "名稱(甲)", "名稱(乙)", "電話(甲)", "電話(乙)", "地址(甲)", "地址(乙)", "乙方指定獸醫診療機構", "親近人", "親近狗", "親近貓", "有攻擊性", "會咬貓", "會咬狗", "會咬人", "容易緊張", "心臟病", "氣喘", "氣管塌陷", "白內障", "癲癇", "手術外傷未癒合", "髖關節問題", "骨折", "腸炎", "血便", "腹膜炎", "艾利希體", "心絲蟲", "腹積水", "傳染性疾病", "懷孕", "血尿", "支付方式(現金、信用卡、其他)", "有無外寄生蟲", "電子郵件", "地址(甲方消費者)", "現金", "其他付款方式", "信用卡", "消費者姓名(以下簡稱甲方)", "年(簽約)"];
+const seenLabels = new Set();   // webhook 進來時順便記下看過的欄位名稱（只記名稱，不記內容）
+async function createOrderFields(extra = [], dry = false) {
+  const skip = new Set(Object.values(F).flat());
+  const all = [...new Set([...BASE_ORDER_FIELDS, '表單名稱', '表單單號', '原始表單', ...seenLabels, ...extra])]
+    .filter(l => l && l.length <= 30 && !skip.has(l) && !/^(服務內容|單價|次數|總費用|期間)\(/.test(l));
+  const out = { created: [], exists_or_rejected: [], planned: dry ? all : undefined };
+  if (dry) return out;
+  for (const name of all) {   // 單線程依序
+    try {
+      await crm('POST', 'extendedattrs', { Name: name, DefaultValue: '', IsRequired: 'False', Domain: 'Order', AttrType: 'TextBox', IsMultiLines: 'False', MaxLength: '255' });
+      out.created.push(name);
+    } catch (e) { out.exists_or_rejected.push(name + ' :: ' + e.message.slice(0, 120)); }
+  }
+  return out;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   if (req.method === 'GET' && url.pathname === '/') return send(res, 200, { ok: true, version: VERSION, dryRun: DRY_RUN });
@@ -239,6 +258,13 @@ const server = http.createServer(async (req, res) => {
     return send(res, 200, { crmStatus: r.status, meaning: r.status === 200 ? 'ApiKey 合法' : 'ApiKey 不合法或店點識別碼錯誤' });
   }
 
+  if (req.method === 'GET' && url.pathname === '/admin/create-order-fields') {
+    if (!authed(url)) return send(res, 401, { error: 'bad token' });
+    const extra = (url.searchParams.get('extra') || '').split(',').map(s => s.trim()).filter(Boolean);
+    try { return send(res, 200, await createOrderFields(extra, url.searchParams.get('dry') !== '0')); }
+    catch (e) { return send(res, 500, { error: e.message }); }
+  }
+
   if (req.method === 'POST' && url.pathname === '/webhook/bizform') {
     if (!authed(url)) return send(res, 401, { error: 'bad token' });
     if (BIZFORM_TOKEN && req.headers['x-bizform-token'] !== BIZFORM_TOKEN) return send(res, 401, { error: 'bad bizform token' });
@@ -247,6 +273,7 @@ const server = http.createServer(async (req, res) => {
     send(res, 200, { received: true }); // 先回覆，避免 BizForm 等太久
     if (body.eventType !== 'documentCreated') return console.log('[skip] eventType', body.eventType);
     if (FORM_IDS.length && !FORM_IDS.includes(String(body.formId))) return console.log('[skip] formId', body.formId);
+    for (const a of (body.document?.attributes || [])) if (!a.readOnly && a.displayName) seenLabels.add(norm(a.displayName));
     console.log('[webhook] form', body.formId, 'doc', body.documentId, 'v', body.version);
     queue = queue.then(() => handleDocument(body)).then(
       (r) => { console.log('[result]', JSON.stringify(r).slice(0, 600)); if (DEBUG) { recent.unshift({ at: new Date().toISOString(), result: r }); recent.length = Math.min(recent.length, 20); } },
