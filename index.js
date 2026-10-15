@@ -5,6 +5,7 @@
 // 預設 DRY_RUN=1：只在 log 顯示「準備要做什麼」，不會真的寫入 CRM。
 const http = require('http');
 
+const VERSION = 'v3-phone-as-name';   // 首頁會顯示，用來確認 Render 跑的是哪一版
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';       // 網址 ?token= 要一致
 const BIZFORM_TOKEN = process.env.BIZFORM_TOKEN || '';       // 選填：BizForm 標頭 x-bizform-token 的值
@@ -24,6 +25,7 @@ const F = {
   address: ['通訊地址', '地址(甲方消費者)'],
 };
 const CRM_EXT_ID_KEY = '國民身分證統一編號/居留證號碼'; // CRM 客戶擴充欄位名稱（你的 CRM 已有）
+const CRM_EXT_NAME_KEY = '姓名';
 
 const recent = [];
 const done = new Set();
@@ -76,8 +78,10 @@ function buildNote(body, p) {
 
 function customerBody(p, isNew) {
   const mech = (SubType, Name, Value) => ({ SubType, Name, Value, IsPrimary: isNew ? 'true' : 'false' });
-  const b = { CurrentName: p.name || p.idNumber || p.phone, ContactMechs: [] };
-  if (p.idNumber) b.ExtendedField = { [CRM_EXT_ID_KEY]: p.idNumber };
+  // 你們的慣例：客戶「姓名」欄放電話（當主鍵），真實姓名放擴充欄位「姓名」
+  const b = { CurrentName: p.phone || p.name || p.idNumber, ContactMechs: [], ExtendedField: {} };
+  if (p.name) b.ExtendedField[CRM_EXT_NAME_KEY] = p.name;
+  if (p.idNumber) b.ExtendedField[CRM_EXT_ID_KEY] = p.idNumber;
   if (p.phone) b.ContactMechs.push(mech('MobilePhone', '手機', p.phone));
   if (p.email) b.ContactMechs.push(mech('Email', '電子郵件', p.email));
   if (p.address) b.ContactMechs.push(mech('PostalAddress', '通訊地址', p.address));
@@ -148,7 +152,7 @@ async function handleDocument(body) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
-  if (req.method === 'GET' && url.pathname === '/') return send(res, 200, { ok: true, dryRun: DRY_RUN });
+  if (req.method === 'GET' && url.pathname === '/') return send(res, 200, { ok: true, version: VERSION, dryRun: DRY_RUN });
 
   if (req.method === 'GET' && url.pathname === '/check-crm') {
     if (!authed(url)) return send(res, 401, { error: 'bad token' });
@@ -177,4 +181,4 @@ const server = http.createServer(async (req, res) => {
   }
   send(res, 404, { error: 'not found' });
 });
-server.listen(PORT, () => console.log('listening on', PORT, DRY_RUN ? '(DRY_RUN)' : '(LIVE)'));
+server.listen(PORT, () => console.log('listening on', PORT, VERSION, DRY_RUN ? '(DRY_RUN)' : '(LIVE)'));
