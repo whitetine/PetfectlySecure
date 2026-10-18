@@ -314,7 +314,7 @@ const ORDER_BODY_CANDIDATES = [
   { CreateDateFrom: '2000/01/01', CreateDateTo: '2099/12/31' },
 ];
 let orderBodyIdx = -1;
-const orderKey = (o) => o.OrderNo ?? o.orderNo ?? o.OrderId ?? o.Id;
+const orderKey = (o) => o.OrderNo ?? o.orderNo ?? o.Number ?? o.number ?? o.OrderNumber ?? o.OrderId ?? o.Id;
 async function fetchOrders() {
   const order = orderBodyIdx >= 0 ? [orderBodyIdx] : ORDER_BODY_CANDIDATES.map((_, i) => i);
   let lastErr = null;
@@ -656,16 +656,42 @@ async function seedTestData(dry) {
     };
   }
   return serial(async () => {
-    const out = { customers: { created: 0, updated: 0, failed: [] }, orders: { ok: 0, failed: [] } };
-    for (const c of plan.customers) {
-      try { await crm('POST', 'customers', c); out.customers.created++; }
-      catch (e) {
-        try { const { CustomerNo, ...rest } = c; await crm('PATCH', `customers/${encodeURIComponent(CustomerNo)}`, rest); out.customers.updated++; }
-        catch (e2) { out.customers.failed.push(`${c.CustomerNo}: ${e2.message.slice(0, 150)}`); }
+    const out = { customers: { created: 0, reused: 0, failed: [] }, orders: { ok: 0, failed: [] }, 顧客編號對照: {} };
+    // CRM 會自己產生客戶編號（例如 CRM20261018005），不會用我們指定的 TEST-C01，
+    // 所以先用測試電話找既有客戶；找不到才新增，並讀回 CRM 實際給的編號，訂單再掛到那個編號底下。
+    const findByPhone = async (phone) => {
+      for (const crit of [{ TelecomNum: phone }, { CurrentName: phone }]) {
+        try {
+          const hit = (await searchCustomers({ ...crit, Page: 1, PageSize: 50 })).find(x => deepHas(x, phone));
+          if (hit) return custNoOf(hit);
+        } catch { /* 這種查詢方式不被接受就換下一種 */ }
       }
+      return null;
+    };
+    const realNo = {};
+    for (const c of plan.customers) {
+      const { CustomerNo: testNo, ...body } = c;
+      const phone = c.CurrentName;
+      try {
+        let no = await findByPhone(phone);
+        if (no) {
+          await crm('PATCH', `customers/${encodeURIComponent(no)}`, body);
+          out.customers.reused++;
+        } else {
+          const j = await crm('POST', 'customers', body);
+          no = j?.data?.CustomerNo ?? j?.CustomerNo ?? (typeof j?.data === 'string' ? (j.data.match(/CRM\d+/) || [])[0] : null);
+          if (!no) no = await findByPhone(phone);
+          if (!no) throw new Error('新增後找不到客戶編號：' + JSON.stringify(j).slice(0, 150));
+          out.customers.created++;
+        }
+        realNo[testNo] = no;
+        out.顧客編號對照[testNo] = no;
+      } catch (e) { out.customers.failed.push(`${testNo}: ${e.message.slice(0, 150)}`); }
     }
     for (const o of plan.orders) {
-      try { await crm('POST', 'orders', o); out.orders.ok++; }
+      const no = realNo[o.CustomerNo];
+      if (!no) { out.orders.failed.push(`${o.OrderNo}: 顧客 ${o.CustomerNo} 沒有建立成功，略過`); continue; }
+      try { await crm('POST', 'orders', { ...o, CustomerNo: no }); out.orders.ok++; }
       catch (e) { out.orders.failed.push(`${o.OrderNo}: ${e.message.slice(0, 150)}`); }
     }
     snapshot = null;   // 清掉快取，下次查詢會讀到新資料
