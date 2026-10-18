@@ -3,9 +3,13 @@
 //   1) 用身分證字號找 CRM 客戶，找到就「合併」基本資料，找不到就新增
 //   2) 每一份表單都在該客戶底下新增「一則獨立的記事」（不覆蓋舊的）
 // 預設 DRY_RUN=1：只在 log 顯示「準備要做什麼」，不會真的寫入 CRM。
+// v7 新增「老闆助手」API（給 iota C.ai 呼叫）：
+//   POST /api/segment      依 AI 解析出的條件，合併「顧客 + 消費/預約」資料後用程式篩選名單
+//   POST /api/coupon/send  老闆確認後，對選定的顧客發送優惠券
+//   GET  /api/status       檢查資料是否讀得到（只回筆數，不含個資）
 const http = require('http');
 
-const VERSION = 'v6-orders-fields';   // 首頁會顯示，用來確認 Render 跑的是哪一版
+const VERSION = 'v7-boss-coupon';     // 首頁會顯示，用來確認 Render 跑的是哪一版
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';       // 網址 ?token= 要一致
 const BIZFORM_TOKEN = process.env.BIZFORM_TOKEN || '';       // 選填：BizForm 標頭 x-bizform-token 的值
@@ -248,6 +252,294 @@ async function createOrderFields(extra = [], dry = false) {
   return out;
 }
 
+// =====================================================================
+// v7：老闆助手（篩選顧客名單 + 發送優惠券）
+// 設計原則：AI 只負責「把老闆的話翻成條件 JSON」，篩選與計算全部由這裡的程式做，
+//           顧客資料（含 CustomerNo）不會送給任何 LLM。
+// =====================================================================
+const API_TOKEN = process.env.API_TOKEN || WEBHOOK_TOKEN;                  // iota 呼叫時帶 header x-api-token 或 ?token=
+const ORDER_SEARCH_PATH = process.env.ORDER_SEARCH_PATH || 'orders/search'; // ⚠ 請對照 Vital CRM API 文件確認
+const ORDER_SEARCH_BODY = (() => { try { return JSON.parse(process.env.ORDER_SEARCH_BODY || '{"OrderDateFrom":"2000/01/01"}'); } catch { return { OrderDateFrom: '2000/01/01' }; } })();
+const CUSTOMER_SEARCH_BODY = { CreateDateFrom: '2000/01/01' };
+const PAGE_SIZE = Number(process.env.PAGE_SIZE || 100);
+const SNAPSHOT_TTL = 5 * 60 * 1000;     // CRM 資料快取 5 分鐘，避免每問一句就把 CRM 全部重抓
+const SEGMENT_TTL = 30 * 60 * 1000;     // 篩出來的名單保留 30 分鐘等老闆確認
+const LIST_SHOW_MAX = 30;               // LINE 訊息最多列出幾位（其餘仍可「全部發送」）
+const DEFAULT_COUPON = process.env.DEFAULT_COUPON || '回娘家優惠券';
+const COUPON_DRY_RUN = process.env.COUPON_DRY_RUN !== '0';   // 優惠券獨立的測試開關：只有設成 0 才會真的發（不影響 BizForm 的 DRY_RUN）
+const DAY = 86400000;
+
+const apiAuthed = (req, url) => !!API_TOKEN && (url.searchParams.get('token') === API_TOKEN || req.headers['x-api-token'] === API_TOKEN);
+const sendCompact = (res, obj) => { res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+async function readJson(req) { let raw = ''; for await (const c of req) raw += c; return JSON.parse(raw || '{}'); }
+// 跟 webhook 共用同一條佇列：CRM API 規範要求單線程依序呼叫
+function serial(fn) { const p = queue.then(() => fn()); queue = p.then(() => {}, () => {}); return p; }
+
+// ---- 日期工具（支援 2026/10/16、2026-10-16、民國 115/10/16）----
+function parseDay(s) {
+  const m = String(s ?? '').match(/(\d{2,4})\s*[\/\-.年]\s*(\d{1,2})\s*[\/\-.月]\s*(\d{1,2})/);
+  if (!m) return null;
+  let y = +m[1]; if (y < 1911) y += 1911;
+  const t = Date.UTC(y, +m[2] - 1, +m[3]);
+  return Number.isNaN(t) ? null : t;
+}
+const todayDay = () => parseDay(taipeiDate(new Date().toISOString()));
+const fmtDay = (t) => { const d = new Date(t); return `${d.getUTCFullYear()}/${String(d.getUTCMonth() + 1).padStart(2, '0')}/${String(d.getUTCDate()).padStart(2, '0')}`; };
+const numOrNull = (s) => { const n = num(s); return Number.isFinite(n) ? n : null; };
+const money = (n) => 'NT$' + Math.round(n || 0).toLocaleString('en-US');
+
+// ---- 讀取全部頁數 ----
+async function fetchAll(path, criteria, keyOf) {
+  const all = [], seen = new Set();
+  for (let page = 1; page <= 200; page++) {
+    const j = await crm('POST', path, { ...criteria, Page: page, PageSize: PAGE_SIZE });
+    const arr = Array.isArray(j) ? j : (j?.data ?? j?.Data ?? []);
+    if (!Array.isArray(arr) || !arr.length) break;
+    let added = 0;
+    for (const x of arr) { const k = keyOf(x) ?? JSON.stringify(x); if (seen.has(k)) continue; seen.add(k); all.push(x); added++; }
+    if (!added || arr.length < PAGE_SIZE) break;   // 沒有新資料（API 忽略 Page）或最後一頁
+  }
+  return all;
+}
+
+// ---- 合併「顧客」與「消費/預約」→ 每位顧客一筆特徵 ----
+const SERVICES = ['洗澡', '剪毛', '大美容', '小美容'];
+const extOf = (o) => (o && (o.ExtendedField || o.extendedField)) || {};
+const custNoOf = (o) => o && (o.CustomerNo ?? o.customerNo ?? o.Customer?.CustomerNo);
+const isPhoneLike = (s) => /^[0-9+\-\s()]{8,}$/.test(String(s ?? '').trim());
+const firstVal = (...vals) => vals.find(v => v !== undefined && v !== null && String(v).trim() !== '');
+const normKind = (s) => { const t = String(s ?? ''); return /犬|狗/.test(t) ? '狗' : /貓/.test(t) ? '貓' : t.trim(); };
+const labelText = (l) => typeof l === 'string' ? l : (l?.Name ?? l?.name ?? l?.LabelName ?? '');
+
+function buildProfiles(customers, orders) {
+  const today = todayDay();
+  const byCust = new Map();
+  for (const o of orders) { const no = custNoOf(o); if (!no) continue; if (!byCust.has(no)) byCust.set(no, []); byCust.get(no).push(o); }
+
+  return customers.map((c) => {
+    const no = custNoOf(c), ce = extOf(c);
+    const counts = { 洗澡: 0, 剪毛: 0, 大美容: 0, 小美容: 0, 其他: 0 };
+    const visits = []; let upcoming = false; let latest = null;
+
+    for (const o of byCust.get(no) || []) {
+      const oe = extOf(o);
+      if (/取消/.test(String(oe['確認/取消'] ?? '') + String(o.OrderStatusName ?? o.Status ?? ''))) continue;
+      const day = parseDay(oe['來訪日期']) ?? parseDay(o.OrderDate ?? o.orderDate);
+      if (day == null) continue;
+      if (day > today) { upcoming = true; continue; }          // 未來的日期 = 已預約、還沒來
+      const items = o.Products || o.products || o.OrderItems || o.Items || [];
+      let sum = 0, isService = false;
+      for (const p of items) {
+        const name = String(p.ProductName ?? p.productName ?? p.Name ?? '');
+        const qty = Number(p.Quantity ?? p.quantity ?? 1) || 1;
+        const price = Number(p.UnitPrice ?? p.unitPrice ?? p.Price ?? 0) || 0;
+        sum += qty * price;
+        if (SERVICES.includes(name)) { counts[name] += qty; isService = true; }
+        else if (price > 0) { counts.其他 += qty; isService = true; }   // 契約等 0 元代表項目不算服務
+      }
+      const total = Number(o.TotalAmount ?? o.Amount ?? NaN);
+      const amount = Number.isFinite(total) && total > 0 ? total : sum;
+      if (!isService && amount <= 0) continue;                  // 純契約/資料表單不算一次來訪
+      visits.push({ day, amount });
+      if (!latest || day >= latest.day) latest = { day, ext: oe };
+    }
+
+    let source = 'orders';
+    let visitCount = visits.length;
+    let total = visits.reduce((s, v) => s + v.amount, 0);
+    let last = visits.length ? Math.max(...visits.map(v => v.day)) : null;
+    let first = visits.length ? Math.min(...visits.map(v => v.day)) : null;
+    let recent90 = visits.filter(v => today - v.day <= 90 * DAY).reduce((s, v) => s + v.amount, 0);
+
+    if (!visitCount) {
+      // 後備：還沒有消費紀錄時，改讀顧客擴充欄位上的彙總（舊版資料放法）
+      source = 'customer';
+      for (const s of SERVICES) counts[s] = numOrNull(ce[`次數(${s})`]) || 0;
+      for (let i = 1; i <= 5; i++) counts.其他 += numOrNull(ce[`次數(其他${i})`]) || 0;
+      const fees = SERVICE_GROUPS.map(g => numOrNull(ce[`總費用(${g})`])).filter(v => v != null);
+      total = fees.length ? fees.reduce((a, b) => a + b, 0) : (numOrNull(ce['金額(新臺幣)']) || 0);
+      last = parseDay(ce['來訪日期']);
+      if (last != null && last > today) { upcoming = true; last = null; }
+      first = null; recent90 = null;
+      const svc = Object.values(counts).reduce((a, b) => a + b, 0);
+      visitCount = svc || (last != null ? 1 : 0);
+    }
+
+    const le = latest?.ext || {};
+    return {
+      id: no,                                   // 內部用，不會出現在給老闆的訊息裡，也不會給 LLM
+      姓名: firstVal(ce['姓名'], isPhoneLike(c.CurrentName) ? undefined : c.CurrentName) || '（未填姓名）',
+      寵物名: firstVal(ce['寵物名'], le['寵物名']) || '',
+      種類: normKind(firstVal(ce['種類(貓、狗)'], le['種類(貓、狗)'])),
+      品種: String(firstVal(ce['犬、貓品種'], le['犬、貓品種']) || ''),
+      寵物年齡: numOrNull(firstVal(ce['犬、貓年齡'], le['犬、貓年齡'])),
+      RFM分群: String(ce['RFM模型分群'] || ''),
+      標籤: (Array.isArray(c.Labels) ? c.Labels : []).map(labelText).filter(Boolean),
+      來訪次數: visitCount,
+      總消費: total,
+      平均客單價: visitCount ? Math.round(total / visitCount) : null,
+      近90天消費: recent90,
+      最後來訪日: last,
+      距上次來訪天數: last != null ? Math.round((today - last) / DAY) : null,
+      距首次來訪天數: first != null ? Math.round((today - first) / DAY) : null,
+      有未來預約: upcoming,
+      洗澡次數: counts.洗澡, 剪毛次數: counts.剪毛, 大美容次數: counts.大美容, 小美容次數: counts.小美容, 其他服務次數: counts.其他,
+      _source: source,
+    };
+  });
+}
+
+let snapshot = null;
+async function loadSnapshot(force = false) {
+  if (!force && snapshot && Date.now() - snapshot.at < SNAPSHOT_TTL) return snapshot;
+  return serial(async () => {
+    const customers = await fetchAll('customers/search', CUSTOMER_SEARCH_BODY, custNoOf);
+    let orders = [], warning = '';
+    try {
+      orders = await fetchAll(ORDER_SEARCH_PATH, ORDER_SEARCH_BODY, o => o.OrderNo ?? o.orderNo);
+    } catch (e) {
+      warning = '讀不到消費/預約資料，暫時改用顧客欄位上的彙總資料';
+      console.warn('[warn-orders]', e.message);
+    }
+    snapshot = { at: Date.now(), customers: customers.length, orders: orders.length, warning, profiles: buildProfiles(customers, orders) };
+    return snapshot;
+  });
+}
+
+// ---- 條件驗證與篩選（白名單：AI 給錯欄位或運算子一律擋掉）----
+const FIELD_TYPES = {
+  距上次來訪天數: 'number', 距首次來訪天數: 'number', 來訪次數: 'number', 總消費: 'number', 平均客單價: 'number', 近90天消費: 'number',
+  洗澡次數: 'number', 剪毛次數: 'number', 大美容次數: 'number', 小美容次數: 'number', 其他服務次數: 'number', 寵物年齡: 'number',
+  種類: 'text', 品種: 'text', RFM分群: 'text', 寵物名: 'text', 姓名: 'text',
+  標籤: 'list', 有未來預約: 'bool', 最後來訪日: 'date',
+};
+const OP_TEXT = { '>=': '≥', '<=': '≤', '>': '>', '<': '<', '=': '=', '!=': '≠', contains: '包含', not_contains: '不包含', is_empty: '沒有資料', not_empty: '有資料' };
+const NO_VALUE_OPS = ['is_empty', 'not_empty'];
+
+function validateFilters(list) {
+  const ok = [], bad = [];
+  for (const f of Array.isArray(list) ? list : []) {
+    const type = FIELD_TYPES[f?.field];
+    const value = f?.value == null ? '' : String(f.value).trim();
+    if (!type || !OP_TEXT[f?.op]) { bad.push(f); continue; }
+    if (!NO_VALUE_OPS.includes(f.op)) {
+      if (type === 'number' && !Number.isFinite(num(value))) { bad.push(f); continue; }
+      if (type === 'date' && parseDay(value) == null) { bad.push(f); continue; }
+      if ((type === 'number' || type === 'date') && /contains/.test(f.op)) { bad.push(f); continue; }
+      if (type !== 'bool' && value === '') { bad.push(f); continue; }
+    }
+    ok.push({ field: f.field, op: f.op, value: f.field === '種類' ? normKind(value) : value });
+  }
+  return { ok, bad };
+}
+
+function matchOne(p, f) {
+  const type = FIELD_TYPES[f.field], v = p[f.field];
+  const empty = v === null || v === undefined || v === '' || (Array.isArray(v) && !v.length);
+  if (f.op === 'is_empty') return empty;
+  if (f.op === 'not_empty') return !empty;
+  if (type === 'bool') { const eq = !!v === /^(true|是|有|1)$/i.test(f.value); return f.op === '!=' ? !eq : eq; }
+  if (empty) return false;                                  // 沒資料的不算符合（不把空白當 0）
+  if (type === 'number' || type === 'date') {
+    const t = type === 'date' ? parseDay(f.value) : num(f.value);
+    switch (f.op) { case '>=': return v >= t; case '<=': return v <= t; case '>': return v > t; case '<': return v < t; case '=': return v === t; case '!=': return v !== t; default: return false; }
+  }
+  const vals = (Array.isArray(v) ? v : [v]).map(x => String(x));
+  const has = vals.some(x => x.includes(f.value)), eq = vals.some(x => x === f.value);
+  switch (f.op) { case '=': return eq; case '!=': return !eq; case 'contains': return has; case 'not_contains': return !has; default: return false; }
+}
+
+const condText = (f) => `${f.field} ${OP_TEXT[f.op]}${NO_VALUE_OPS.includes(f.op) ? '' : ' ' + f.value}`;
+const segments = new Map();
+const newSegmentId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+
+function profileLine(p, i) {
+  const pet = [p.寵物名, p.種類].filter(Boolean).join(' ');
+  const last = p.最後來訪日 != null ? `上次 ${fmtDay(p.最後來訪日)}（${p.距上次來訪天數} 天前）` : '無來訪日期';
+  return `${i + 1}. ${p.姓名}${pet ? '｜' + pet : ''}｜${last}｜來 ${p.來訪次數} 次｜${money(p.總消費)}`;
+}
+
+async function handleSegment(body) {
+  if (body?.error) return { status: 'error', message: 'AI 沒有成功理解這句話，請換個說法再試一次。' };
+  if (body?.intent === 'other') return { status: 'other', message: '這個問題不是「篩選顧客」的需求喔。\n\n可以試試：\n• 找出半年沒來、洗澡 5 次以上的狗狗\n• 消費最高的前 10 位顧客\n• 這個月有來、但還沒預約下次的貓咪' };
+  if (body?.intent === 'clarify') return { status: 'clarify', message: body.clarify_question || '可以再說清楚一點要找哪些顧客嗎？' };
+
+  const { ok, bad } = validateFilters(body?.filters);
+  const sortField = (FIELD_TYPES[body?.sort_field] === 'number' || body?.sort_field === '最後來訪日') ? body.sort_field : null;
+  const limit = Math.max(0, Math.min(500, parseInt(body?.limit, 10) || 0));
+  if (!ok.length && !(sortField && limit)) {
+    return { status: 'clarify', message: '我沒辦法從這句話整理出篩選條件 🙏\n請說明要找哪些顧客，例如「三個月沒來的貓咪」。' };
+  }
+
+  const snap = await loadSnapshot();
+  let list = snap.profiles.filter(p => ok.every(f => matchOne(p, f)));
+  if (sortField) {
+    const dir = body.sort_order === 'asc' ? 1 : -1;
+    list = list.filter(p => p[sortField] != null).sort((a, b) => (a[sortField] - b[sortField]) * dir);
+  }
+  if (limit) list = list.slice(0, limit);
+
+  const head = [`🎯 條件：${body.summary || ok.map(condText).join('、')}`];
+  const detail = ok.map(condText);
+  if (sortField) detail.push(`依${sortField}${body.sort_order === 'asc' ? '由低到高' : '由高到低'}${limit ? `取前 ${limit} 位` : ''}`);
+  head.push('（' + detail.join('；') + '）');
+  if (bad.length) head.push(`⚠️ 有 ${bad.length} 個條件無法辨識，已略過`);
+  if (snap.warning) head.push(`⚠️ ${snap.warning}`);
+
+  if (!list.length) return { status: 'empty', message: [...head, '', '👤 沒有符合條件的顧客。'].join('\n') };
+
+  const segmentId = newSegmentId();
+  const coupon = String(body.coupon_name || '').trim() || DEFAULT_COUPON;
+  segments.set(segmentId, { at: Date.now(), coupon, items: list.map(p => ({ id: p.id, 姓名: p.姓名 })) });
+  for (const [k, s] of segments) if (Date.now() - s.at > SEGMENT_TTL) segments.delete(k);
+
+  const lines = [...head, `👤 符合 ${list.length} 位顧客`, ''];
+  list.slice(0, LIST_SHOW_MAX).forEach((p, i) => lines.push(profileLine(p, i)));
+  if (list.length > LIST_SHOW_MAX) lines.push(`…其餘 ${list.length - LIST_SHOW_MAX} 位未列出（選「全部發送」會一起發）`);
+  lines.push('', `🎟️ 優惠券：${coupon}`);
+  return { status: 'ok', segmentId, count: list.length, message: lines.join('\n') };
+}
+
+// 實際發券的管道。目前先在 CRM 該顧客底下留一則記事（可追蹤誰拿過券）。
+// TODO：之後換成真正的發送方式，例如 LINE 推播（需要顧客的 LINE userId）、簡訊或 CRM 的優惠券功能。
+async function deliverCoupon(target, coupon) {
+  await crm('POST', 'notes', {
+    CustomerNo: target.id,
+    Content: `**🎟️ 發送優惠券：${coupon}**\n- 發送時間：${new Date().toISOString()}\n- 來源：老闆助手（iota C.ai）`,
+    IsPublic: false, IsMarkdown: true,
+  });
+}
+
+async function handleSend(body) {
+  const seg = segments.get(body?.segmentId);
+  if (!seg || Date.now() - seg.at > SEGMENT_TTL) return { status: 'expired', message: '這份名單已過期或已經發送過，請重新查詢一次。' };
+  const n = seg.items.length;
+  let idx = body.pick === 'all' ? seg.items.map((_, i) => i + 1) : (Array.isArray(body.pick) ? body.pick : []).map(Number);
+  const ex = new Set((Array.isArray(body.exclude) ? body.exclude : []).map(Number));
+  idx = [...new Set(idx)].filter(i => Number.isInteger(i) && i >= 1 && i <= n && !ex.has(i));
+  if (!idx.length) return { status: 'invalid', message: `沒有選到任何顧客，請輸入 1～${n} 之間的編號，例如：1,3,5 或 1-10。` };
+
+  const targets = idx.map(i => seg.items[i - 1]);
+  const coupon = String(body.coupon || seg.coupon).slice(0, 50);
+  const preview = targets.slice(0, 10).map(t => '• ' + t.姓名).join('\n') + (targets.length > 10 ? `\n…等 ${targets.length} 位` : '');
+
+  if (COUPON_DRY_RUN) return { status: 'dry_run', message: `🧪 測試模式：預計發送「${coupon}」給 ${targets.length} 位顧客\n${preview}\n\n（Render 環境變數 COUPON_DRY_RUN=0 才會真的發送）` };
+
+  segments.delete(body.segmentId);   // 先移除，避免老闆連按兩次重複發送
+  const r = await serial(async () => {
+    const out = { ok: 0, fail: [] };
+    for (const t of targets) {
+      try { await deliverCoupon(t, coupon); out.ok++; }
+      catch (e) { out.fail.push(t.姓名); console.error('[error-coupon]', e.message); }
+    }
+    return out;
+  });
+  return {
+    status: 'sent',
+    message: `✅ 已發送「${coupon}」給 ${r.ok} 位顧客` + (r.fail.length ? `\n⚠️ ${r.fail.length} 位失敗：${r.fail.slice(0, 10).join('、')}` : ''),
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   if (req.method === 'GET' && url.pathname === '/') return send(res, 200, { ok: true, version: VERSION, dryRun: DRY_RUN });
@@ -285,6 +577,29 @@ const server = http.createServer(async (req, res) => {
     if (!DEBUG || !authed(url)) return send(res, 404, { error: 'not found' });
     return send(res, 200, recent);
   }
+
+  // ---- v7 老闆助手 API ----
+  if (req.method === 'POST' && (url.pathname === '/api/segment' || url.pathname === '/api/coupon/send')) {
+    if (!apiAuthed(req, url)) return send(res, 401, { status: 'error', message: 'bad token' });
+    let body; try { body = await readJson(req); } catch { return sendCompact(res, { status: 'error', message: '請求格式錯誤' }); }
+    try { return sendCompact(res, url.pathname === '/api/segment' ? await handleSegment(body) : await handleSend(body)); }
+    catch (e) { console.error('[error-api]', e.message); return sendCompact(res, { status: 'error', message: '系統暫時讀不到 CRM 資料，請稍後再試。' }); }
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/status') {
+    if (!apiAuthed(req, url)) return send(res, 401, { error: 'bad token' });
+    try {
+      const s = await loadSnapshot(url.searchParams.get('refresh') === '1');
+      const p = s.profiles;
+      return send(res, 200, {
+        version: VERSION, customers: s.customers, orders: s.orders, warning: s.warning || null,
+        有消費紀錄的顧客: p.filter(x => x._source === 'orders').length,
+        只有顧客欄位彙總的顧客: p.filter(x => x._source === 'customer').length,
+        有最後來訪日: p.filter(x => x.最後來訪日 != null).length,
+        有寵物種類: p.filter(x => x.種類).length,
+      });
+    } catch (e) { return send(res, 500, { error: e.message }); }
+  }
   send(res, 404, { error: 'not found' });
 });
-server.listen(PORT, () => console.log('listening on', PORT, VERSION, DRY_RUN ? '(DRY_RUN)' : '(LIVE)'));
+server.listen(PORT, () => console.log('listening on', PORT, VERSION, DRY_RUN ? '(DRY_RUN)' : '(LIVE)', COUPON_DRY_RUN ? '[優惠券:測試模式]' : '[優惠券:正式發送]'));
