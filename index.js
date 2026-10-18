@@ -297,9 +297,56 @@ async function fetchAll(path, criteria, keyOf) {
     if (!Array.isArray(arr) || !arr.length) break;
     let added = 0;
     for (const x of arr) { const k = keyOf(x) ?? JSON.stringify(x); if (seen.has(k)) continue; seen.add(k); all.push(x); added++; }
-    if (!added || arr.length < PAGE_SIZE) break;   // 沒有新資料（API 忽略 Page）或最後一頁
+    if (!added) break;   // 沒有新資料（API 忽略 Page）。注意：orders/search 每頁固定 10 筆，不能用「少於 PageSize」判斷最後一頁
   }
   return all;
+}
+
+// ---- 訂單（預約）：查詢條件格式不確定，依序試幾種，第一個抓得到資料的就記住 ----
+const ORDER_BODY_CANDIDATES = [
+  ...(process.env.ORDER_SEARCH_BODY ? [ORDER_SEARCH_BODY] : []),
+  { CustomerType: 'PersonAccount', CreateDate: { From: '2000/01/01', To: '2099/12/31' } },   // LINE 綁定 Apps Script 實測可用的格式
+  { CustomerType: 'PersonAccount' },
+  {},
+  { OrderDateFrom: '2000/01/01' },
+  { CreateDateFrom: '2000/01/01' },
+  { OrderDateFrom: '2000/01/01', OrderDateTo: '2099/12/31' },
+  { CreateDateFrom: '2000/01/01', CreateDateTo: '2099/12/31' },
+];
+let orderBodyIdx = -1;
+const orderKey = (o) => o.OrderNo ?? o.orderNo ?? o.OrderId ?? o.Id;
+async function fetchOrders() {
+  const order = orderBodyIdx >= 0 ? [orderBodyIdx] : ORDER_BODY_CANDIDATES.map((_, i) => i);
+  let lastErr = null;
+  for (const i of order) {
+    try {
+      const arr = await fetchAll(ORDER_SEARCH_PATH, ORDER_BODY_CANDIDATES[i], orderKey);
+      if (arr.length) {
+        if (orderBodyIdx !== i) console.log('[info] 訂單查詢條件可用，編號', i);
+        orderBodyIdx = i;
+        // 列表資料可能沒有擴充欄位／產品明細 → 用編號讀完整資料（跟 LINE 綁定 Apps Script 的 getOrder_ 一樣）
+        const full = [];
+        for (const o of arr) {
+          const no = orderKey(o);
+          const hasExt = Object.keys(extOf(o)).length > 0;
+          const hasItems = (o.Products || o.products || o.Items || o.items || []).length > 0;
+          if (no && (!hasExt || !hasItems)) {
+            try {
+              const j = await crm('GET', `orders/${encodeURIComponent(no)}`);
+              const d = j?.data ?? j?.Data ?? j;
+              const one = Array.isArray(d) ? d[0] : d;
+              full.push(one && typeof one === 'object' ? { ...o, ...one } : o);
+              continue;
+            } catch (e) { console.warn('[warn-order-detail]', no, e.message.slice(0, 120)); }
+          }
+          full.push(o);
+        }
+        return full;
+      }
+    } catch (e) { lastErr = e; }
+  }
+  if (lastErr) throw lastErr;
+  return [];
 }
 
 // ---- 合併「顧客」與「消費/預約」→ 每位顧客一筆特徵 ----
@@ -323,8 +370,9 @@ function buildProfiles(customers, orders) {
 
     for (const o of byCust.get(no) || []) {
       const oe = extOf(o);
-      if (/取消/.test(String(oe['確認/取消'] ?? '') + String(o.OrderStatusName ?? o.Status ?? ''))) continue;
-      const day = parseDay(oe['來訪日期']) ?? parseDay(o.OrderDate ?? o.orderDate);
+      if (/取消/.test(String(oe['確認/取消'] ?? '') + String(o.OrderStatusName ?? o.OrderStatus ?? o.Status ?? ''))) continue;
+      // 預約日：優先用「預約時段」（例如 2026-10-18 16:00），沒有才用來訪日期、訂單日期
+      const day = parseDay(oe['預約時段']) ?? parseDay(o['預約時段']) ?? parseDay(oe['來訪日期']) ?? parseDay(o.OrderDate ?? o.orderDate);
       if (day == null) continue;
       if (day > today) { upcoming = true; continue; }          // 未來的日期 = 已預約、還沒來
       const items = o.Products || o.products || o.OrderItems || o.Items || [];
@@ -337,7 +385,7 @@ function buildProfiles(customers, orders) {
         if (SERVICES.includes(name)) { counts[name] += qty; isService = true; }
         else if (price > 0) { counts.其他 += qty; isService = true; }   // 契約等 0 元代表項目不算服務
       }
-      const total = Number(o.TotalAmount ?? o.Amount ?? NaN);
+      const total = Number(o.TotalAmount ?? o.OrderTotal ?? o.OrderAmount ?? o.Amount ?? o.Total ?? NaN);
       const amount = Number.isFinite(total) && total > 0 ? total : sum;
       if (!isService && amount <= 0) continue;                  // 純契約/資料表單不算一次來訪
       visits.push({ day, amount });
@@ -396,7 +444,7 @@ async function loadSnapshot(force = false) {
     const customers = await fetchAll('customers/search', CUSTOMER_SEARCH_BODY, custNoOf);
     let orders = [], warning = '';
     try {
-      orders = await fetchAll(ORDER_SEARCH_PATH, ORDER_SEARCH_BODY, o => o.OrderNo ?? o.orderNo);
+      orders = await fetchOrders();
     } catch (e) {
       warning = '讀不到消費/預約資料，暫時改用顧客欄位上的彙總資料';
       console.warn('[warn-orders]', e.message);
@@ -540,6 +588,91 @@ async function handleSend(body) {
   };
 }
 
+// =====================================================================
+// 測試資料：12 位測試顧客 + 30 筆「過去」的預約訂單
+// - 全部是過去日期、不填行事曆事件ID → 不會佔用 Google 日曆上 open 的時段
+// - 顧客編號 TEST-C01…、訂單編號 TEST-ORD-001…、姓名前面加「測試-」，之後好找好刪
+// - 日期以「執行當天」往前推，所以「幾天前」永遠符合設計
+// - 預設 dry=1 只顯示計畫；網址加 &dry=0 才寫入。重跑同一個訂單編號只會更新、不會重複
+// =====================================================================
+const PRICE = { 洗澡: 600, 剪毛: 900, 大美容: 1500, 小美容: 1000 };
+// [編號, 姓名, 寵物名, 種類, 品種, 年齡, 預約紀錄: [幾天前, 服務, 是否取消]]
+const SEED = [
+  ['01', '王小明', '小柴', '狗', '柴犬', '4歲',   [[440,'洗澡'],[380,'洗澡'],[320,'洗澡'],[260,'洗澡'],[200,'洗澡']]],  // 洗澡熟客，半年沒來
+  ['02', '陳美玲', '奶油', '狗', '貴賓', '3歲',   [[140,'大美容'],[95,'大美容'],[55,'大美容'],[20,'大美容']]],        // 高消費、活躍
+  ['03', '林志豪', '咪咪', '貓', '英短', '2歲',   [[250,'洗澡'],[170,'洗澡'],[100,'洗澡']]],                          // 貓，三個月沒來
+  ['04', '張雅婷', '阿福', '狗', '米克斯', '1歲', [[10,'洗澡']]],                                                    // 新客
+  ['05', '黃俊傑', '雪球', '貓', '布偶', '5歲',   [[360,'大美容'],[300,'洗澡']]],                                     // 流失
+  ['06', '吳佩珊', '豆豆', '狗', '柴犬', '6歲',   [[180,'剪毛'],[120,'剪毛'],[60,'剪毛']]],                           // 剪毛，兩個月沒來
+  ['07', '劉家豪', '可可', '狗', '貴賓', '2歲',   [[90,'大美容'],[50,'小美容'],[15,'大美容']]],                       // 活躍
+  ['08', '蔡宜君', '花花', '貓', '美短', '4歲',   [[210,'洗澡'],[150,'洗澡',true]]],                                  // 有一筆取消
+  ['09', '鄭宇翔', '球球', '狗', '博美', '8歲',   [[400,'小美容']]],                                                  // 一年多前來一次
+  ['10', '許淑芬', '黑糖', '貓', '米克斯', '3歲', [[120,'洗澡'],[45,'洗澡']]],
+  ['11', '謝明哲', '短腿', '狗', '柯基', '3歲',   [[260,'大美容'],[190,'大美容']]],                                   // 大美容，半年沒來
+  ['12', '洪詩涵', '糖糖', '狗', '馬爾濟斯', '1歲', [[25,'洗澡',true],[5,'洗澡']]],                                   // 新客，有一筆取消
+];
+const SLOTS = ['09:00', '11:00', '13:00', '15:00'];
+
+function seedPlan() {
+  const today = todayDay();
+  const customers = [], orders = [];
+  let n = 0;
+  for (const [id, name, pet, kind, breed, age, visits] of SEED) {
+    const customerNo = `TEST-C${id}`, phone = `09990000${id}`;
+    const petExt = { 寵物名: pet, '種類(貓、狗)': kind, '犬、貓品種': breed, '犬、貓年齡': age };
+    customers.push({
+      CustomerNo: customerNo, CurrentName: phone,
+      ContactMechs: [{ SubType: 'MobilePhone', Name: '手機', Value: phone, IsPrimary: 'true' }],
+      ExtendedField: { [CRM_EXT_NAME_KEY]: `測試-${name}`, ...petExt },
+    });
+    for (const [daysAgo, svc, cancelled] of visits) {
+      n++;
+      const day = fmtDay(today - daysAgo * DAY);
+      orders.push({
+        OrderNo: `TEST-ORD-${String(n).padStart(3, '0')}`,
+        CustomerType: 'PersonAccount', CustomerNo: customerNo,
+        OrderDate: day,
+        OrderStatusName: cancelled ? '取消-已釋出' : '確認',
+        Products: [{ ProductName: svc, Quantity: 1, UnitPrice: PRICE[svc] }],
+        ExtendedField: {
+          預約時段: `${day.replace(/\//g, '-')} ${SLOTS[n % SLOTS.length]}`,
+          ...petExt,
+          '金額(新臺幣)': String(PRICE[svc]),
+          表單名稱: '測試資料（seed）',
+        },
+      });
+    }
+  }
+  return { customers, orders };
+}
+
+async function seedTestData(dry) {
+  const plan = seedPlan();
+  if (dry) {
+    return {
+      dryRun: true, 說明: '這只是預覽，沒有寫入。確認後在網址加上 &dry=0 才會真的建立。',
+      顧客數: plan.customers.length, 訂單數: plan.orders.length,
+      預覽: plan.orders.map(o => `${o.OrderNo}｜${o.CustomerNo}｜${o.ExtendedField.預約時段}｜${o.Products[0].ProductName}｜${o.OrderStatusName}`),
+    };
+  }
+  return serial(async () => {
+    const out = { customers: { created: 0, updated: 0, failed: [] }, orders: { ok: 0, failed: [] } };
+    for (const c of plan.customers) {
+      try { await crm('POST', 'customers', c); out.customers.created++; }
+      catch (e) {
+        try { const { CustomerNo, ...rest } = c; await crm('PATCH', `customers/${encodeURIComponent(CustomerNo)}`, rest); out.customers.updated++; }
+        catch (e2) { out.customers.failed.push(`${c.CustomerNo}: ${e2.message.slice(0, 150)}`); }
+      }
+    }
+    for (const o of plan.orders) {
+      try { await crm('POST', 'orders', o); out.orders.ok++; }
+      catch (e) { out.orders.failed.push(`${o.OrderNo}: ${e.message.slice(0, 150)}`); }
+    }
+    snapshot = null;   // 清掉快取，下次查詢會讀到新資料
+    return out;
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   if (req.method === 'GET' && url.pathname === '/') return send(res, 200, { ok: true, version: VERSION, dryRun: DRY_RUN });
@@ -584,6 +717,32 @@ const server = http.createServer(async (req, res) => {
     let body; try { body = await readJson(req); } catch { return sendCompact(res, { status: 'error', message: '請求格式錯誤' }); }
     try { return sendCompact(res, url.pathname === '/api/segment' ? await handleSegment(body) : await handleSend(body)); }
     catch (e) { console.error('[error-api]', e.message); return sendCompact(res, { status: 'error', message: '系統暫時讀不到 CRM 資料，請稍後再試。' }); }
+  }
+
+  // 除錯：試每一種訂單查詢條件，回傳筆數與「欄位名稱」（不回傳任何欄位內容，不含個資）
+  if (req.method === 'GET' && url.pathname === '/api/debug-orders') {
+    if (!apiAuthed(req, url)) return send(res, 401, { error: 'bad token' });
+    const out = await serial(async () => {
+      const r = [];
+      for (const body of ORDER_BODY_CANDIDATES) {
+        try {
+          const j = await crm('POST', ORDER_SEARCH_PATH, { ...body, Page: 1, PageSize: 5 });
+          const arr = Array.isArray(j) ? j : (j?.data ?? j?.Data ?? []);
+          r.push({ body, message: j?.message ?? null, 回傳最外層欄位: j && typeof j === 'object' && !Array.isArray(j) ? Object.keys(j) : 'array',
+            筆數: Array.isArray(arr) ? arr.length : null,
+            訂單欄位: Array.isArray(arr) && arr[0] ? Object.keys(arr[0]) : [],
+            擴充欄位: Array.isArray(arr) && arr[0] ? Object.keys(extOf(arr[0])).slice(0, 80) : [] });
+        } catch (e) { r.push({ body, error: e.message.slice(0, 200) }); }
+      }
+      return r;
+    });
+    return send(res, 200, out);
+  }
+
+  if (req.method === 'GET' && url.pathname === '/admin/seed-test-data') {
+    if (!apiAuthed(req, url)) return send(res, 401, { error: 'bad token' });
+    try { return send(res, 200, await seedTestData(url.searchParams.get('dry') !== '0')); }
+    catch (e) { return send(res, 500, { error: e.message }); }
   }
 
   if (req.method === 'GET' && url.pathname === '/api/status') {
