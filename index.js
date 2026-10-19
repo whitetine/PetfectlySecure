@@ -499,22 +499,38 @@ function matchOne(p, f) {
 }
 
 const condText = (f) => `${f.field} ${OP_TEXT[f.op]}${NO_VALUE_OPS.includes(f.op) ? '' : ' ' + f.value}`;
-// 名單不存在伺服器記憶體（Render 重啟或休眠就會消失），而是整份名單加上簽章放進 segmentId 交給 iota 保管。
-// 送回來時驗證簽章，確定名單沒被竄改、沒過期，再發送。
+// 名單不存在伺服器記憶體（Render 重啟或休眠就會消失）。segmentId 只放「篩選條件＋人數」並加上簽章，
+// 長度約 80 字元，不怕 iota 變數長度限制；發送時用同樣條件重新篩一次，人數不同就請老闆重新查詢。
 const SIGN_KEY = () => API_TOKEN || CRM_API_KEY || 'dev-only-key';
 const b64u = (buf) => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-const sign = (data) => b64u(crypto.createHmac('sha256', SIGN_KEY()).update(data).digest()).slice(0, 32);
-function packSegment(seg) {
-  const data = b64u(JSON.stringify({ t: seg.at, c: seg.coupon, i: seg.items.map(x => [x.id, x.姓名]) }));
+const sign = (data) => b64u(crypto.createHmac('sha256', SIGN_KEY()).update(data).digest()).slice(0, 12);
+const FIELD_LIST = Object.keys(FIELD_TYPES), OP_LIST = Object.keys(OP_TEXT);
+function packSegment(q) {
+  const arr = [Math.floor(Date.now() / 1000).toString(36), q.coupon === DEFAULT_COUPON ? '' : q.coupon,
+    q.sortField ? FIELD_LIST.indexOf(q.sortField) : -1, q.sortOrder === 'asc' ? 1 : 0, q.limit, q.count,
+    q.filters.map(f => [FIELD_LIST.indexOf(f.field), OP_LIST.indexOf(f.op), f.value])];
+  const data = b64u(JSON.stringify(arr));
   return data + '.' + sign(data);
 }
 function unpackSegment(token) {
-  const [data, sig] = String(token || '').split('.');
+  const [data, sig] = String(token || '').trim().split('.');
   if (!data || !sig || sign(data) !== sig) return null;
   try {
-    const o = JSON.parse(Buffer.from(data.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
-    return { at: o.t, coupon: o.c, items: (o.i || []).map(([id, 姓名]) => ({ id, 姓名 })) };
+    const [t, c, si, so, limit, count, fs] = JSON.parse(Buffer.from(data.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+    return {
+      at: parseInt(t, 36) * 1000, coupon: c || DEFAULT_COUPON, limit, count,
+      sortField: si >= 0 ? FIELD_LIST[si] : null, sortOrder: so === 1 ? 'asc' : 'desc',
+      filters: fs.map(([fi, oi, value]) => ({ field: FIELD_LIST[fi], op: OP_LIST[oi], value })),
+    };
   } catch { return null; }
+}
+function runSegment(profiles, q) {
+  let list = profiles.filter(p => q.filters.every(f => matchOne(p, f)));
+  if (q.sortField) {
+    const dir = q.sortOrder === 'asc' ? 1 : -1;
+    list = list.filter(p => p[q.sortField] != null).sort((a, b) => (a[q.sortField] - b[q.sortField]) * dir);
+  }
+  return q.limit ? list.slice(0, q.limit) : list;
 }
 const usedSegments = new Set();   // 盡量避免同一份名單被重複發送（伺服器重啟後會清空）
 
@@ -537,12 +553,8 @@ async function handleSegment(body) {
   }
 
   const snap = await loadSnapshot();
-  let list = snap.profiles.filter(p => ok.every(f => matchOne(p, f)));
-  if (sortField) {
-    const dir = body.sort_order === 'asc' ? 1 : -1;
-    list = list.filter(p => p[sortField] != null).sort((a, b) => (a[sortField] - b[sortField]) * dir);
-  }
-  if (limit) list = list.slice(0, limit);
+  const q = { filters: ok, sortField, sortOrder: body.sort_order === 'asc' ? 'asc' : 'desc', limit };
+  const list = runSegment(snap.profiles, q);
 
   const head = [`🎯 條件：${body.summary || ok.map(condText).join('、')}`];
   const detail = ok.map(condText);
@@ -554,7 +566,7 @@ async function handleSegment(body) {
   if (!list.length) return { status: 'empty', message: [...head, '', '👤 沒有符合條件的顧客。'].join('\n') };
 
   const coupon = String(body.coupon_name || '').trim() || DEFAULT_COUPON;
-  const segmentId = packSegment({ at: Date.now(), coupon, items: list.map(p => ({ id: p.id, 姓名: p.姓名 })) });
+  const segmentId = packSegment({ ...q, coupon, count: list.length });
 
   const lines = [...head, `👤 符合 ${list.length} 位顧客`, ''];
   list.slice(0, LIST_SHOW_MAX).forEach((p, i) => lines.push(profileLine(p, i)));
@@ -575,16 +587,22 @@ async function deliverCoupon(target, coupon) {
 
 async function handleSend(body) {
   const seg = unpackSegment(body?.segmentId);
-  if (!seg) return { status: 'expired', message: '這份名單無法辨識，請重新查詢一次。' };
+  if (!seg) {
+    console.warn('[warn-segment] 無法辨識的 segmentId，長度', String(body?.segmentId || '').length, String(body?.segmentId || '').slice(0, 20));
+    return { status: 'expired', message: `這份名單無法辨識，請重新查詢一次。（收到的名單代碼長度：${String(body?.segmentId || '').length}）` };
+  }
   if (Date.now() - seg.at > SEGMENT_TTL) return { status: 'expired', message: '這份名單已超過 30 分鐘，請重新查詢一次，確保名單是最新的。' };
   if (usedSegments.has(body.segmentId)) return { status: 'expired', message: '這份名單已經發送過了，不會重複發送。' };
-  const n = seg.items.length;
-  let idx = body.pick === 'all' ? seg.items.map((_, i) => i + 1) : (Array.isArray(body.pick) ? body.pick : []).map(Number);
+  // 用同樣的條件重新篩一次，人數要跟老闆看到的一樣才發
+  const items = runSegment((await loadSnapshot()).profiles, seg).map(p => ({ id: p.id, 姓名: p.姓名 }));
+  if (items.length !== seg.count) return { status: 'expired', message: `名單有變動（原本 ${seg.count} 位，現在 ${items.length} 位），請重新查詢一次再發送。` };
+  const n = items.length;
+  let idx = body.pick === 'all' ? items.map((_, i) => i + 1) : (Array.isArray(body.pick) ? body.pick : []).map(Number);
   const ex = new Set((Array.isArray(body.exclude) ? body.exclude : []).map(Number));
   idx = [...new Set(idx)].filter(i => Number.isInteger(i) && i >= 1 && i <= n && !ex.has(i));
   if (!idx.length) return { status: 'invalid', message: `沒有選到任何顧客，請輸入 1～${n} 之間的編號，例如：1,3,5 或 1-10。` };
 
-  const targets = idx.map(i => seg.items[i - 1]);
+  const targets = idx.map(i => items[i - 1]);
   const coupon = String(body.coupon || seg.coupon).slice(0, 50);
   const preview = targets.slice(0, 10).map(t => '• ' + t.姓名).join('\n') + (targets.length > 10 ? `\n…等 ${targets.length} 位` : '');
 
