@@ -8,6 +8,7 @@
 //   POST /api/coupon/send  老闆確認後，對選定的顧客發送優惠券
 //   GET  /api/status       檢查資料是否讀得到（只回筆數，不含個資）
 const http = require('http');
+const crypto = require('crypto');
 
 const VERSION = 'v7-boss-coupon';     // 首頁會顯示，用來確認 Render 跑的是哪一版
 const PORT = process.env.PORT || 3000;
@@ -498,8 +499,24 @@ function matchOne(p, f) {
 }
 
 const condText = (f) => `${f.field} ${OP_TEXT[f.op]}${NO_VALUE_OPS.includes(f.op) ? '' : ' ' + f.value}`;
-const segments = new Map();
-const newSegmentId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+// 名單不存在伺服器記憶體（Render 重啟或休眠就會消失），而是整份名單加上簽章放進 segmentId 交給 iota 保管。
+// 送回來時驗證簽章，確定名單沒被竄改、沒過期，再發送。
+const SIGN_KEY = () => API_TOKEN || CRM_API_KEY || 'dev-only-key';
+const b64u = (buf) => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const sign = (data) => b64u(crypto.createHmac('sha256', SIGN_KEY()).update(data).digest()).slice(0, 32);
+function packSegment(seg) {
+  const data = b64u(JSON.stringify({ t: seg.at, c: seg.coupon, i: seg.items.map(x => [x.id, x.姓名]) }));
+  return data + '.' + sign(data);
+}
+function unpackSegment(token) {
+  const [data, sig] = String(token || '').split('.');
+  if (!data || !sig || sign(data) !== sig) return null;
+  try {
+    const o = JSON.parse(Buffer.from(data.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+    return { at: o.t, coupon: o.c, items: (o.i || []).map(([id, 姓名]) => ({ id, 姓名 })) };
+  } catch { return null; }
+}
+const usedSegments = new Set();   // 盡量避免同一份名單被重複發送（伺服器重啟後會清空）
 
 function profileLine(p, i) {
   const pet = [p.寵物名, p.種類].filter(Boolean).join(' ');
@@ -536,10 +553,8 @@ async function handleSegment(body) {
 
   if (!list.length) return { status: 'empty', message: [...head, '', '👤 沒有符合條件的顧客。'].join('\n') };
 
-  const segmentId = newSegmentId();
   const coupon = String(body.coupon_name || '').trim() || DEFAULT_COUPON;
-  segments.set(segmentId, { at: Date.now(), coupon, items: list.map(p => ({ id: p.id, 姓名: p.姓名 })) });
-  for (const [k, s] of segments) if (Date.now() - s.at > SEGMENT_TTL) segments.delete(k);
+  const segmentId = packSegment({ at: Date.now(), coupon, items: list.map(p => ({ id: p.id, 姓名: p.姓名 })) });
 
   const lines = [...head, `👤 符合 ${list.length} 位顧客`, ''];
   list.slice(0, LIST_SHOW_MAX).forEach((p, i) => lines.push(profileLine(p, i)));
@@ -559,8 +574,10 @@ async function deliverCoupon(target, coupon) {
 }
 
 async function handleSend(body) {
-  const seg = segments.get(body?.segmentId);
-  if (!seg || Date.now() - seg.at > SEGMENT_TTL) return { status: 'expired', message: '這份名單已過期或已經發送過，請重新查詢一次。' };
+  const seg = unpackSegment(body?.segmentId);
+  if (!seg) return { status: 'expired', message: '這份名單無法辨識，請重新查詢一次。' };
+  if (Date.now() - seg.at > SEGMENT_TTL) return { status: 'expired', message: '這份名單已超過 30 分鐘，請重新查詢一次，確保名單是最新的。' };
+  if (usedSegments.has(body.segmentId)) return { status: 'expired', message: '這份名單已經發送過了，不會重複發送。' };
   const n = seg.items.length;
   let idx = body.pick === 'all' ? seg.items.map((_, i) => i + 1) : (Array.isArray(body.pick) ? body.pick : []).map(Number);
   const ex = new Set((Array.isArray(body.exclude) ? body.exclude : []).map(Number));
@@ -573,7 +590,7 @@ async function handleSend(body) {
 
   if (COUPON_DRY_RUN) return { status: 'dry_run', message: `🧪 測試模式：預計發送「${coupon}」給 ${targets.length} 位顧客\n${preview}\n\n（Render 環境變數 COUPON_DRY_RUN=0 才會真的發送）` };
 
-  segments.delete(body.segmentId);   // 先移除，避免老闆連按兩次重複發送
+  usedSegments.add(body.segmentId);   // 先記下來，避免老闆連按兩次重複發送
   const r = await serial(async () => {
     const out = { ok: 0, fail: [] };
     for (const t of targets) {
