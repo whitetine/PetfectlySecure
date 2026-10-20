@@ -352,7 +352,11 @@ async function fetchOrders() {
 
 // ---- 合併「顧客」與「消費/預約」→ 每位顧客一筆特徵 ----
 const SERVICES = ['洗澡', '剪毛', '大美容', '小美容'];
-const extOf = (o) => (o && (o.ExtendedField || o.extendedField)) || {};
+const extOf = (o) => {
+  const e = o && (o.ExtendedField || o.ExtendedFields || o.extendedField);
+  if (Array.isArray(e)) { const out = {}; for (const it of e) { const k = it?.Key ?? it?.key ?? it?.Name ?? it?.name; if (k) out[k] = it?.Value ?? it?.value; } return out; }
+  return e || {};
+};
 const custNoOf = (o) => o && (o.CustomerNo ?? o.customerNo ?? o.Customer?.CustomerNo);
 const isPhoneLike = (s) => /^[0-9+\-\s()]{8,}$/.test(String(s ?? '').trim());
 const firstVal = (...vals) => vals.find(v => v !== undefined && v !== null && String(v).trim() !== '');
@@ -658,6 +662,7 @@ async function pushLine(userId, message) {
 async function deliverCoupon(target, coupon) {
   const expire = fmtDay(todayDay() + COUPON_VALID_DAYS * DAY);
   const code = newCouponCode();
+  await saveCouponOrder({ code, customerNo: target.id, coupon, expire, status: '未使用', issuedAt: nowTaipei(), usedAt: '' });
   let line = 'none';      // none = 沒綁 LINE；sent = 已推播；failed = 推播失敗；off = 伺服器沒設定 LINE token
   let lineErr = '';
   if (target.lineId) {
@@ -682,6 +687,62 @@ async function deliverCoupon(target, coupon) {
     IsPublic: false, IsMarkdown: true,
   });
   return line;
+}
+
+// ---- 優惠券登記：每張券是一筆 0 元「消費」，消費編號 = 優惠碼（CRM 可直接用編號查到，重啟也不會消失）----
+const COUPON_FORM_NAME = '優惠券';
+const COUPON_FIELDS = ['優惠券名稱', '優惠券狀態', '有效期限', '發送時間', '核銷時間'];
+let couponFieldsReady = false;
+async function ensureCouponFields() {
+  if (couponFieldsReady) return;
+  for (const name of COUPON_FIELDS) {   // 已存在的會被 CRM 拒絕（400），視為已存在
+    try { await crm('POST', 'extendedattrs', { Name: name, DefaultValue: '', IsRequired: 'False', Domain: 'Order', AttrType: 'TextBox', IsMultiLines: 'False', MaxLength: '255' }); }
+    catch { /* 已存在 */ }
+  }
+  couponFieldsReady = true;
+}
+async function saveCouponOrder(c) {
+  await ensureCouponFields();
+  await crm('POST', 'orders', {
+    OrderNo: c.code, CustomerType: 'PersonAccount', CustomerNo: c.customerNo, OrderDate: fmtDay(todayDay()),
+    Products: [{ ProductName: `優惠券：${c.coupon}`.slice(0, 50), Quantity: 1, UnitPrice: 0 }],
+    ExtendedField: { 表單名稱: COUPON_FORM_NAME, 優惠券名稱: c.coupon, 優惠券狀態: c.status, 有效期限: c.expire, 發送時間: c.issuedAt, 核銷時間: c.usedAt },
+  });
+}
+async function getCouponOrder(code) {
+  let j;
+  try { j = await crm('GET', `orders/${encodeURIComponent(code)}`); } catch (e) { if (/-> 404/.test(e.message)) return null; throw e; }
+  const d = j?.data ?? j?.Data ?? j;
+  const o = Array.isArray(d) ? d[0] : d;
+  if (!o || !(o.OrderNo ?? o.orderNo)) return null;
+  const e = extOf(o);
+  if (e.表單名稱 !== COUPON_FORM_NAME) return null;   // 不是優惠券的消費，不處理
+  return { code, customerNo: custNoOf(o), coupon: e.優惠券名稱 || '', status: e.優惠券狀態 || '未使用', expire: e.有效期限 || '', issuedAt: e.發送時間 || '', usedAt: e.核銷時間 || '' };
+}
+const CODE_RE = new RegExp(`${COUPON_PREFIX}\\s*-?\\s*([A-Z0-9]{6})`, 'i');
+
+async function handleRedeem(body) {
+  const text = String(body?.text ?? body?.code ?? '').normalize('NFKC');
+  const m = text.match(CODE_RE);
+  if (!m) return { status: 'invalid', message: `請輸入優惠碼，例如：核銷 ${COUPON_PREFIX}-AB12CD` };
+  const code = `${COUPON_PREFIX}-${m[1].toUpperCase()}`;
+  const wantRedeem = /核銷|使用|兌換|用掉/.test(text);
+  return serial(async () => {
+    const c = await getCouponOrder(code);
+    if (!c) return { status: 'not_found', message: `❌ 查無優惠碼 ${code}，請確認有沒有打錯。` };
+    const who = (snapshot?.profiles || []).find(p => p.id === c.customerNo);
+    const head = `🎟️ ${code}｜${c.coupon}\n👤 ${who ? who.姓名 : c.customerNo}${who?.寵物名 ? `（${who.寵物名}）` : ''}\n📅 有效期限：${c.expire}`;
+    const expired = c.expire && parseDay(c.expire) != null && parseDay(c.expire) < todayDay();
+    if (c.status === '已使用') return { status: 'used', message: `${head}\n\n⚠️ 這張券已經在 ${c.usedAt} 使用過了，不能再使用。` };
+    if (expired) return { status: 'expired', message: `${head}\n\n⚠️ 這張券已過期，不能使用。` };
+    if (!wantRedeem) return { status: 'valid', message: `${head}\n\n✅ 可以使用。要核銷請輸入「核銷 ${code}」` };
+    const usedAt = nowTaipei();
+    await saveCouponOrder({ ...c, status: '已使用', usedAt });
+    try {
+      await crm('POST', 'notes', { CustomerNo: c.customerNo, Content: `**✅ 優惠券已核銷 ${code}｜${c.coupon}**\n- 核銷時間：${usedAt}\n- 來源：老闆助手（iota C.ai）`, IsPublic: false, IsMarkdown: true });
+    } catch (e) { console.warn('[warn-redeem-note]', e.message); }
+    return { status: 'redeemed', message: `${head}\n\n✅ 核銷成功（${usedAt}）` };
+  });
 }
 
 async function handleSend(body) {
@@ -876,10 +937,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ---- v7 老闆助手 API ----
-  if (req.method === 'POST' && (url.pathname === '/api/segment' || url.pathname === '/api/coupon/send')) {
+  if (req.method === 'POST' && ['/api/segment', '/api/coupon/send', '/api/coupon/redeem'].includes(url.pathname)) {
     if (!apiAuthed(req, url)) return send(res, 401, { status: 'error', message: 'bad token' });
     let body; try { body = await readJson(req); } catch { return sendCompact(res, { status: 'error', message: '請求格式錯誤' }); }
-    try { return sendCompact(res, url.pathname === '/api/segment' ? await handleSegment(body) : await handleSend(body)); }
+    try { return sendCompact(res, url.pathname === '/api/segment' ? await handleSegment(body) : url.pathname === '/api/coupon/redeem' ? await handleRedeem(body) : await handleSend(body)); }
     catch (e) { console.error('[error-api]', e.message); return sendCompact(res, { status: 'error', message: '系統暫時讀不到 CRM 資料，請稍後再試。' }); }
   }
 
