@@ -9,8 +9,9 @@
 //   GET  /api/status       檢查資料是否讀得到（只回筆數，不含個資）
 const http = require('http');
 const crypto = require('crypto');
+const owner = require('./owner');   // v10：老闆身分（綁定碼 + 管理頁）
 
-const VERSION = 'v9-coupon-orderno';     // 首頁會顯示，用來確認 Render 跑的是哪一版
+const VERSION = 'v10-owner-bind';       // 首頁會顯示，用來確認 Render 跑的是哪一版
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';       // 網址 ?token= 要一致
 const BIZFORM_TOKEN = process.env.BIZFORM_TOKEN || '';       // 選填：BizForm 標頭 x-bizform-token 的值
@@ -269,6 +270,8 @@ const LIST_SHOW_MAX = 30;               // LINE 訊息最多列出幾位（其�
 const DEFAULT_COUPON = process.env.DEFAULT_COUPON || '回娘家優惠券';
 const COUPON_DRY_RUN = process.env.COUPON_DRY_RUN !== '0';   // 優惠券獨立的測試開關：只有設成 0 才會真的發（不影響 BizForm 的 DRY_RUN）
 const DAY = 86400000;
+// 設成 1 後，老闆助手 API 會檢查 body.userId 是不是老闆（iota 那邊要先把 userId 帶進來再打開）
+const OWNER_CHECK = process.env.OWNER_CHECK === '1';
 
 const apiAuthed = (req, url) => !!API_TOKEN && (url.searchParams.get('token') === API_TOKEN || req.headers['x-api-token'] === API_TOKEN);
 const sendCompact = (res, obj) => { res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
@@ -958,6 +961,7 @@ async function seedTestData(dry) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
+  if (await owner.handle(req, res, url)) return;   // /api/role、/api/bind、/admin
   if (req.method === 'GET' && url.pathname === '/') return send(res, 200, { ok: true, version: VERSION, dryRun: DRY_RUN });
 
   if (req.method === 'GET' && url.pathname === '/check-crm') {
@@ -998,6 +1002,10 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && ['/api/segment', '/api/coupon/send', '/api/coupon/redeem'].includes(url.pathname)) {
     if (!apiAuthed(req, url)) return send(res, 401, { status: 'error', message: 'bad token' });
     let body; try { body = await readJson(req); } catch { return sendCompact(res, { status: 'error', message: '請求格式錯誤' }); }
+    if (OWNER_CHECK && !(await owner.isOwner(body?.userId))) {
+      console.warn('[owner] 非管理員呼叫老闆功能', url.pathname);
+      return sendCompact(res, { status: 'forbidden', message: '這個功能只有管理員可以使用。' });
+    }
     try { return sendCompact(res, url.pathname === '/api/segment' ? await handleSegment(body) : url.pathname === '/api/coupon/redeem' ? await handleRedeem(body) : await handleSend(body)); }
     catch (e) { console.error('[error-api]', e.message); return sendCompact(res, { status: 'error', message: '系統暫時讀不到 CRM 資料，請稍後再試。' }); }
   }
