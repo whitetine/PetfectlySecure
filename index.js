@@ -593,22 +593,63 @@ async function handleSegment(body) {
   return { status: 'ok', segmentId, count: list.length, message: lines.join('\n') };
 }
 
-// ---- 實際發券：有綁 LINE 的顧客推播 LINE 訊息，每位顧客都在 CRM 留一則記事（可追蹤誰拿過券）----
+// ---- 實際發券：每張券一組專屬優惠碼；有綁 LINE 的顧客推播「優惠券卡片」，每位顧客都在 CRM 留一則記事 ----
 const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || '';   // LINE Developers → 你的 Messaging API channel → Channel access token
 const LINE_API_BASE = process.env.LINE_API_BASE || 'https://api.line.me';
 const SHOP_NAME = process.env.SHOP_NAME || '寵此安心';
 const COUPON_VALID_DAYS = Number(process.env.COUPON_VALID_DAYS || 30);
+const COUPON_PREFIX = process.env.COUPON_PREFIX || 'PS';
+const COUPON_TERMS = process.env.COUPON_TERMS || '每張限用一次，不可與其他優惠併用';
+const BOOK_TEXT = process.env.BOOK_TEXT || '我要預約';               // 按「立即預約」時替顧客送出的文字，要能觸發你們的 LINE 預約流程
+const BRAND = process.env.BRAND_COLOR || '#4B6B50';                 // 跟預約日期卡同一個綠色
 
-function couponText(target, coupon, expire) {
-  const pet = target.寵物名 ? `${target.寵物名}好久不見，我們很想念牠喔！\n` : '';
-  return `🎟️ ${SHOP_NAME}送您一張「${coupon}」\n\n${pet}預約時出示這則訊息即可使用。\n有效期限：${expire}\n\n期待再次見到你們 🐾`;
+const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';               // 去掉 0/O、1/I 這些容易看錯的字
+function newCouponCode() {
+  const b = crypto.randomBytes(6);
+  let s = '';
+  for (let i = 0; i < 6; i++) s += CODE_CHARS[b[i] % CODE_CHARS.length];
+  return `${COUPON_PREFIX}-${s}`;
+}
+const nowTaipei = () => new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date());
+
+function couponFlex(target, coupon, code, expire) {
+  const name = String(target.姓名 || '').replace(/^測試-/, '');
+  const forWho = target.寵物名 ? `給 ${target.寵物名} 的專屬優惠` : (name && !/未填/.test(name) ? `給 ${name} 的專屬優惠` : '您的專屬優惠');
+  const txt = (text, o = {}) => ({ type: 'text', text, wrap: true, ...o });
+  const row = (label, value, o = {}) => ({ type: 'box', layout: 'baseline', spacing: 'sm', contents: [
+    txt(label, { size: 'sm', color: '#888888', flex: 2 }), txt(value, { size: 'sm', color: '#333333', flex: 5, ...o })] });
+  return {
+    type: 'flex',
+    altText: `🎟️ ${SHOP_NAME}送您一張「${coupon}」，優惠碼 ${code}`,
+    contents: {
+      type: 'bubble',
+      header: { type: 'box', layout: 'vertical', backgroundColor: BRAND, paddingAll: '20px', contents: [
+        txt(`🎟️ ${SHOP_NAME}`, { color: '#FFFFFFCC', size: 'sm' }),
+        txt(coupon, { color: '#FFFFFF', size: 'xxl', weight: 'bold', margin: 'sm' }),
+        txt(forWho, { color: '#FFFFFF', size: 'sm', margin: 'sm' }),
+      ] },
+      body: { type: 'box', layout: 'vertical', spacing: 'md', contents: [
+        ...(target.寵物名 ? [txt(`${target.寵物名}好久不見，我們很想念牠喔！`, { size: 'sm', color: '#555555' })] : []),
+        { type: 'box', layout: 'vertical', backgroundColor: '#F3F6F3', cornerRadius: '8px', paddingAll: '12px', margin: 'md', contents: [
+          txt('優惠碼', { size: 'xs', color: '#888888', align: 'center' }),
+          txt(code, { size: 'xxl', weight: 'bold', color: BRAND, align: 'center' }),
+        ] },
+        row('有效期限', expire),
+        row('使用方式', '預約或結帳時出示此券'),
+        row('注意事項', COUPON_TERMS, { color: '#888888' }),
+      ] },
+      footer: { type: 'box', layout: 'vertical', contents: [
+        { type: 'button', style: 'primary', color: BRAND, action: { type: 'message', label: '立即預約', text: BOOK_TEXT } },
+      ] },
+    },
+  };
 }
 
-async function pushLine(userId, text) {
+async function pushLine(userId, message) {
   const r = await fetch(`${LINE_API_BASE}/v2/bot/message/push`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ to: userId, messages: [{ type: 'text', text }] }),
+    body: JSON.stringify({ to: userId, messages: [message] }),
     signal: AbortSignal.timeout(15000),
   });
   if (!r.ok) throw new Error(`LINE ${r.status} ${(await r.text()).slice(0, 200)}`);
@@ -616,19 +657,28 @@ async function pushLine(userId, text) {
 
 async function deliverCoupon(target, coupon) {
   const expire = fmtDay(todayDay() + COUPON_VALID_DAYS * DAY);
+  const code = newCouponCode();
   let line = 'none';      // none = 沒綁 LINE；sent = 已推播；failed = 推播失敗；off = 伺服器沒設定 LINE token
   let lineErr = '';
   if (target.lineId) {
     if (!LINE_TOKEN) line = 'off';
     else {
-      try { await pushLine(target.lineId, couponText(target, coupon, expire)); line = 'sent'; }
+      try { await pushLine(target.lineId, couponFlex(target, coupon, code, expire)); line = 'sent'; }
       catch (e) { line = 'failed'; lineErr = e.message; console.error('[error-line]', target.id, e.message); }
     }
   }
-  const lineText = { none: '顧客未綁定 LINE', sent: '已推播', failed: `推播失敗（${lineErr.slice(0, 80)}）`, off: '伺服器未設定 LINE，未推播' }[line];
+  const lineText = { none: '顧客未綁定 LINE（請門市告知優惠碼）', sent: '已推播優惠券卡片', failed: `推播失敗（${lineErr.slice(0, 80)}）`, off: '伺服器未設定 LINE，未推播' }[line];
   await crm('POST', 'notes', {
     CustomerNo: target.id,
-    Content: `**🎟️ 發送優惠券：${coupon}**\n- 有效期限：${expire}\n- LINE：${lineText}\n- 發送時間：${new Date().toISOString()}\n- 來源：老闆助手（iota C.ai）`,
+    Content: [
+      `**🎟️ 優惠券 ${code}｜${coupon}**`,
+      `- 狀態：未使用`,
+      `- 有效期限：${expire}`,
+      `- 注意事項：${COUPON_TERMS}`,
+      `- LINE：${lineText}`,
+      `- 發送時間：${nowTaipei()}`,
+      `- 來源：老闆助手（iota C.ai）`,
+    ].join('\n'),
     IsPublic: false, IsMarkdown: true,
   });
   return line;
