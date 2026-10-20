@@ -357,6 +357,23 @@ const custNoOf = (o) => o && (o.CustomerNo ?? o.customerNo ?? o.Customer?.Custom
 const isPhoneLike = (s) => /^[0-9+\-\s()]{8,}$/.test(String(s ?? '').trim());
 const firstVal = (...vals) => vals.find(v => v !== undefined && v !== null && String(v).trim() !== '');
 const normKind = (s) => { const t = String(s ?? ''); return /犬|狗/.test(t) ? '狗' : /貓/.test(t) ? '貓' : t.trim(); };
+// LINE userId：跟 LINE 綁定 Apps Script 的 getLineId_ 讀法一樣（存在客戶的 GeneralIdentities.Line）
+function lineIdOf(c) {
+  for (const k of ['GeneralIdentities', 'generalIdentities', 'Identities', 'ExternalIdentities']) {
+    const box = c?.[k];
+    if (!box) continue;
+    if (Array.isArray(box)) {
+      for (const it of box) {
+        const key = it?.Key ?? it?.key ?? it?.Name ?? it?.name ?? it?.Type ?? it?.type ?? it?.IdentityType;
+        if (/^line$/i.test(String(key || ''))) { const v = it?.Value ?? it?.value ?? it?.Id ?? it?.id ?? it?.Identity; if (v) return String(v); }
+      }
+    } else if (typeof box === 'object') {
+      const v = box.Line ?? box.line ?? box.LINE;
+      if (v) return String(v);
+    }
+  }
+  return '';
+}
 const labelText = (l) => typeof l === 'string' ? l : (l?.Name ?? l?.name ?? l?.LabelName ?? '');
 
 function buildProfiles(customers, orders) {
@@ -433,6 +450,7 @@ function buildProfiles(customers, orders) {
       距首次來訪天數: first != null ? Math.round((today - first) / DAY) : null,
       有未來預約: upcoming,
       洗澡次數: counts.洗澡, 剪毛次數: counts.剪毛, 大美容次數: counts.大美容, 小美容次數: counts.小美容, 其他服務次數: counts.其他,
+      lineId: lineIdOf(c),
       _source: source,
     };
   });
@@ -575,14 +593,45 @@ async function handleSegment(body) {
   return { status: 'ok', segmentId, count: list.length, message: lines.join('\n') };
 }
 
-// 實際發券的管道。目前先在 CRM 該顧客底下留一則記事（可追蹤誰拿過券）。
-// TODO：之後換成真正的發送方式，例如 LINE 推播（需要顧客的 LINE userId）、簡訊或 CRM 的優惠券功能。
+// ---- 實際發券：有綁 LINE 的顧客推播 LINE 訊息，每位顧客都在 CRM 留一則記事（可追蹤誰拿過券）----
+const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || '';   // LINE Developers → 你的 Messaging API channel → Channel access token
+const LINE_API_BASE = process.env.LINE_API_BASE || 'https://api.line.me';
+const SHOP_NAME = process.env.SHOP_NAME || '寵此安心';
+const COUPON_VALID_DAYS = Number(process.env.COUPON_VALID_DAYS || 30);
+
+function couponText(target, coupon, expire) {
+  const pet = target.寵物名 ? `${target.寵物名}好久不見，我們很想念牠喔！\n` : '';
+  return `🎟️ ${SHOP_NAME}送您一張「${coupon}」\n\n${pet}預約時出示這則訊息即可使用。\n有效期限：${expire}\n\n期待再次見到你們 🐾`;
+}
+
+async function pushLine(userId, text) {
+  const r = await fetch(`${LINE_API_BASE}/v2/bot/message/push`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ to: userId, messages: [{ type: 'text', text }] }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) throw new Error(`LINE ${r.status} ${(await r.text()).slice(0, 200)}`);
+}
+
 async function deliverCoupon(target, coupon) {
+  const expire = fmtDay(todayDay() + COUPON_VALID_DAYS * DAY);
+  let line = 'none';      // none = 沒綁 LINE；sent = 已推播；failed = 推播失敗；off = 伺服器沒設定 LINE token
+  let lineErr = '';
+  if (target.lineId) {
+    if (!LINE_TOKEN) line = 'off';
+    else {
+      try { await pushLine(target.lineId, couponText(target, coupon, expire)); line = 'sent'; }
+      catch (e) { line = 'failed'; lineErr = e.message; console.error('[error-line]', target.id, e.message); }
+    }
+  }
+  const lineText = { none: '顧客未綁定 LINE', sent: '已推播', failed: `推播失敗（${lineErr.slice(0, 80)}）`, off: '伺服器未設定 LINE，未推播' }[line];
   await crm('POST', 'notes', {
     CustomerNo: target.id,
-    Content: `**🎟️ 發送優惠券：${coupon}**\n- 發送時間：${new Date().toISOString()}\n- 來源：老闆助手（iota C.ai）`,
+    Content: `**🎟️ 發送優惠券：${coupon}**\n- 有效期限：${expire}\n- LINE：${lineText}\n- 發送時間：${new Date().toISOString()}\n- 來源：老闆助手（iota C.ai）`,
     IsPublic: false, IsMarkdown: true,
   });
+  return line;
 }
 
 async function handleSend(body) {
@@ -594,7 +643,7 @@ async function handleSend(body) {
   if (Date.now() - seg.at > SEGMENT_TTL) return { status: 'expired', message: '這份名單已超過 30 分鐘，請重新查詢一次，確保名單是最新的。' };
   if (usedSegments.has(body.segmentId)) return { status: 'expired', message: '這份名單已經發送過了，不會重複發送。' };
   // 用同樣的條件重新篩一次，人數要跟老闆看到的一樣才發
-  const items = runSegment((await loadSnapshot()).profiles, seg).map(p => ({ id: p.id, 姓名: p.姓名 }));
+  const items = runSegment((await loadSnapshot()).profiles, seg).map(p => ({ id: p.id, 姓名: p.姓名, 寵物名: p.寵物名, lineId: p.lineId }));
   if (items.length !== seg.count) return { status: 'expired', message: `名單有變動（原本 ${seg.count} 位，現在 ${items.length} 位），請重新查詢一次再發送。` };
   const n = items.length;
   let idx = body.pick === 'all' ? items.map((_, i) => i + 1) : (Array.isArray(body.pick) ? body.pick : []).map(Number);
@@ -604,22 +653,26 @@ async function handleSend(body) {
 
   const targets = idx.map(i => items[i - 1]);
   const coupon = String(body.coupon || seg.coupon).slice(0, 50);
-  const preview = targets.slice(0, 10).map(t => '• ' + t.姓名).join('\n') + (targets.length > 10 ? `\n…等 ${targets.length} 位` : '');
+  const preview = targets.slice(0, 10).map(t => '• ' + t.姓名 + (t.lineId ? '（LINE ✓）' : '（未綁 LINE）')).join('\n') + (targets.length > 10 ? `\n…等 ${targets.length} 位` : '');
 
-  if (COUPON_DRY_RUN) return { status: 'dry_run', message: `🧪 測試模式：預計發送「${coupon}」給 ${targets.length} 位顧客\n${preview}\n\n（Render 環境變數 COUPON_DRY_RUN=0 才會真的發送）` };
+  if (COUPON_DRY_RUN) return { status: 'dry_run', message: `🧪 測試模式：預計發送「${coupon}」給 ${targets.length} 位顧客\n${preview}\n\n（Render 環境變數 COUPON_DRY_RUN=0 才會真的發送）${LINE_TOKEN ? '' : '\n⚠️ 尚未設定 LINE_CHANNEL_ACCESS_TOKEN，發送時不會推播 LINE'}` };
 
   usedSegments.add(body.segmentId);   // 先記下來，避免老闆連按兩次重複發送
   const r = await serial(async () => {
-    const out = { ok: 0, fail: [] };
+    const out = { ok: 0, fail: [], line: { sent: 0, none: 0, failed: 0, off: 0 } };
     for (const t of targets) {
-      try { await deliverCoupon(t, coupon); out.ok++; }
+      try { const l = await deliverCoupon(t, coupon); out.line[l]++; out.ok++; }
       catch (e) { out.fail.push(t.姓名); console.error('[error-coupon]', e.message); }
     }
     return out;
   });
   return {
     status: 'sent',
-    message: `✅ 已發送「${coupon}」給 ${r.ok} 位顧客` + (r.fail.length ? `\n⚠️ ${r.fail.length} 位失敗：${r.fail.slice(0, 10).join('、')}` : ''),
+    message: `✅ 已發送「${coupon}」給 ${r.ok} 位顧客（已記錄在 CRM）`
+      + `\n📱 LINE 推播成功 ${r.line.sent} 位` + (r.line.none ? `，${r.line.none} 位未綁定 LINE` : '')
+      + (r.line.failed ? `\n⚠️ LINE 推播失敗 ${r.line.failed} 位` : '')
+      + (r.line.off ? `\n⚠️ 伺服器尚未設定 LINE，有 ${r.line.off} 位綁定 LINE 的顧客沒有推播` : '')
+      + (r.fail.length ? `\n⚠️ ${r.fail.length} 位失敗：${r.fail.slice(0, 10).join('、')}` : ''),
   };
 }
 
