@@ -267,7 +267,7 @@ const SNAPSHOT_TTL = 5 * 60 * 1000;     // CRM 資料快取 5 分鐘，避免每
 const SEGMENT_TTL = 30 * 60 * 1000;     // 篩出來的名單保留 30 分鐘等老闆確認
 const LIST_SHOW_MAX = 30;               // LINE 訊息最多列出幾位（其餘仍可「全部發送」）
 const DEFAULT_COUPON = process.env.DEFAULT_COUPON || '回娘家優惠券';
-const COUPON_DRY_RUN = process.env.COUPON_DRY_RUN == '0';   // 優惠券獨立的測試開關：只有設成 0 才會真的發（不影響 BizForm 的 DRY_RUN）
+const COUPON_DRY_RUN = process.env.COUPON_DRY_RUN = '0';   // 優惠券獨立的測試開關：只有設成 0 才會真的發（不影響 BizForm 的 DRY_RUN）
 const DAY = 86400000;
 
 const apiAuthed = (req, url) => !!API_TOKEN && (url.searchParams.get('token') === API_TOKEN || req.headers['x-api-token'] === API_TOKEN);
