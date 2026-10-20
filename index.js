@@ -10,7 +10,7 @@
 const http = require('http');
 const crypto = require('crypto');
 
-const VERSION = 'v7-boss-coupon';     // 首頁會顯示，用來確認 Render 跑的是哪一版
+const VERSION = 'v9-coupon-orderno';     // 首頁會顯示，用來確認 Render 跑的是哪一版
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';       // 網址 ?token= 要一致
 const BIZFORM_TOKEN = process.env.BIZFORM_TOKEN || '';       // 選填：BizForm 標頭 x-bizform-token 的值
@@ -607,12 +607,26 @@ const COUPON_TERMS = process.env.COUPON_TERMS || '每張限用一次，不可與
 const BOOK_TEXT = process.env.BOOK_TEXT || '我要預約';               // 按「立即預約」時替顧客送出的文字，要能觸發你們的 LINE 預約流程
 const BRAND = process.env.BRAND_COLOR || '#4B6B50';                 // 跟預約日期卡同一個綠色
 
-const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';               // 去掉 0/O、1/I 這些容易看錯的字
-function newCouponCode() {
-  const b = crypto.randomBytes(6);
-  let s = '';
-  for (let i = 0; i < 6; i++) s += CODE_CHARS[b[i] % CODE_CHARS.length];
-  return `${COUPON_PREFIX}-${s}`;
+const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';               // 去掉 0/O、1/I 這些容易看錯的字（剛好 32 個）
+// CRM 會自己產生消費編號（例如 ORDER000000000058），不能自訂。
+// 所以優惠碼 = 前綴 + 消費編號的數字（32 進位）+ 3 碼驗證碼，核銷時直接反推回消費編號去 CRM 讀取。
+// 驗證碼用伺服器密鑰算，別人就算知道規則也編不出有效的優惠碼。
+const ORDER_NO_PREFIX = process.env.ORDER_NO_PREFIX || 'ORDER';
+const ORDER_NO_DIGITS = Number(process.env.ORDER_NO_DIGITS || 12);
+const encNum = (n) => { let s = ''; do { s = CODE_CHARS[n % 32] + s; n = Math.floor(n / 32); } while (n > 0); return s; };
+const decNum = (s) => { let n = 0; for (const ch of s) { const i = CODE_CHARS.indexOf(ch); if (i < 0) return null; n = n * 32 + i; } return n; };
+const codeCheck = (num) => { const h = crypto.createHmac('sha256', SIGN_KEY()).update('coupon:' + num).digest(); return CODE_CHARS[h[0] % 32] + CODE_CHARS[h[1] % 32] + CODE_CHARS[h[2] % 32]; };
+const orderNum = (orderNo) => { const m = String(orderNo || '').match(/(\d+)$/); return m ? Number(m[1]) : null; };
+function codeForOrder(orderNo) {
+  const n = orderNum(orderNo);
+  if (n == null) throw new Error('消費編號沒有數字，無法產生優惠碼：' + orderNo);
+  return `${COUPON_PREFIX}-${encNum(n)}${codeCheck(n)}`;
+}
+function orderNoFromCode(tail) {   // tail = 優惠碼前綴後面的字
+  if (tail.length < 4) return null;
+  const n = decNum(tail.slice(0, -3));
+  if (n == null || codeCheck(n) !== tail.slice(-3)) return null;
+  return ORDER_NO_PREFIX + String(n).padStart(ORDER_NO_DIGITS, '0');
 }
 const nowTaipei = () => new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date());
 
@@ -661,8 +675,11 @@ async function pushLine(userId, message) {
 
 async function deliverCoupon(target, coupon) {
   const expire = fmtDay(todayDay() + COUPON_VALID_DAYS * DAY);
-  const code = newCouponCode();
-  await saveCouponOrder({ code, customerNo: target.id, coupon, expire, status: '未使用', issuedAt: nowTaipei(), usedAt: '' });
+  const issuedAt = nowTaipei();
+  // 先在 CRM 建立優惠券消費，拿到 CRM 給的消費編號，再算出優惠碼寫回去；登記成功才推播
+  const orderNo = await createCouponOrder(target.id, coupon);
+  const code = codeForOrder(orderNo);
+  await writeCouponOrder({ orderNo, code, customerNo: target.id, coupon, expire, status: '未使用', issuedAt, usedAt: '' });
   let line = 'none';      // none = 沒綁 LINE；sent = 已推播；failed = 推播失敗；off = 伺服器沒設定 LINE token
   let lineErr = '';
   if (target.lineId) {
@@ -681,7 +698,8 @@ async function deliverCoupon(target, coupon) {
       `- 有效期限：${expire}`,
       `- 注意事項：${COUPON_TERMS}`,
       `- LINE：${lineText}`,
-      `- 發送時間：${nowTaipei()}`,
+      `- 對應消費：${orderNo}`,
+      `- 發送時間：${issuedAt}`,
       `- 來源：老闆助手（iota C.ai）`,
     ].join('\n'),
     IsPublic: false, IsMarkdown: true,
@@ -689,9 +707,9 @@ async function deliverCoupon(target, coupon) {
   return line;
 }
 
-// ---- 優惠券登記：每張券是一筆 0 元「消費」，消費編號 = 優惠碼（CRM 可直接用編號查到，重啟也不會消失）----
+// ---- 優惠券登記：每張券是一筆 0 元「消費」，擴充欄位記優惠碼與狀態（CRM 裡查得到，重啟也不會消失）----
 const COUPON_FORM_NAME = '優惠券';
-const COUPON_FIELDS = ['優惠券名稱', '優惠券狀態', '有效期限', '發送時間', '核銷時間'];
+const COUPON_FIELDS = ['優惠碼', '優惠券名稱', '優惠券狀態', '有效期限', '發送時間', '核銷時間'];
 let couponFieldsReady = false;
 async function ensureCouponFields() {
   if (couponFieldsReady) return;
@@ -701,34 +719,74 @@ async function ensureCouponFields() {
   }
   couponFieldsReady = true;
 }
-async function saveCouponOrder(c) {
-  await ensureCouponFields();
-  await crm('POST', 'orders', {
-    OrderNo: c.code, CustomerType: 'PersonAccount', CustomerNo: c.customerNo, OrderDate: fmtDay(todayDay()),
-    Products: [{ ProductName: `優惠券：${c.coupon}`.slice(0, 50), Quantity: 1, UnitPrice: 0 }],
-    ExtendedField: { 表單名稱: COUPON_FORM_NAME, 優惠券名稱: c.coupon, 優惠券狀態: c.status, 有效期限: c.expire, 發送時間: c.issuedAt, 核銷時間: c.usedAt },
-  });
-}
-async function getCouponOrder(code) {
+const couponProducts = (coupon) => [{ ProductName: `優惠券：${coupon}`.slice(0, 50), Quantity: 1, UnitPrice: 0 }];
+
+async function getOrderDetail(no) {
   let j;
-  try { j = await crm('GET', `orders/${encodeURIComponent(code)}`); } catch (e) { if (/-> 404/.test(e.message)) return null; throw e; }
+  try { j = await crm('GET', `orders/${encodeURIComponent(no)}`); } catch (e) { if (/-> 404/.test(e.message)) return null; throw e; }
   const d = j?.data ?? j?.Data ?? j;
   const o = Array.isArray(d) ? d[0] : d;
-  if (!o || !(o.OrderNo ?? o.orderNo)) return null;
-  const e = extOf(o);
-  if (e.表單名稱 !== COUPON_FORM_NAME) return null;   // 不是優惠券的消費，不處理
-  return { code, customerNo: custNoOf(o), coupon: e.優惠券名稱 || '', status: e.優惠券狀態 || '未使用', expire: e.有效期限 || '', issuedAt: e.發送時間 || '', usedAt: e.核銷時間 || '' };
+  return o && (o.OrderNo ?? o.orderNo) ? o : null;
 }
-const CODE_RE = new RegExp(`${COUPON_PREFIX}\\s*-?\\s*([A-Z0-9]{6})`, 'i');
+
+// 新增一筆優惠券消費（讓 CRM 自己編號），回傳 CRM 給的消費編號
+async function createCouponOrder(customerNo, coupon) {
+  await ensureCouponFields();
+  const marker = 'PENDING-' + crypto.randomBytes(6).toString('hex');   // 暫時標記，用來找回剛建立的那一筆
+  const j = await crm('POST', 'orders', {
+    CustomerType: 'PersonAccount', CustomerNo: customerNo, OrderDate: fmtDay(todayDay()),
+    Products: couponProducts(coupon),
+    ExtendedField: { 表單名稱: COUPON_FORM_NAME, 優惠碼: marker, 優惠券名稱: coupon, 優惠券狀態: '產生中' },
+  });
+  const fromResp = j?.data?.OrderNo ?? j?.data?.orderNo ?? j?.OrderNo ?? j?.orderNo
+    ?? (JSON.stringify(j ?? '').match(new RegExp(`${ORDER_NO_PREFIX}\\d{4,}`)) || [])[0];
+  if (fromResp && orderNum(fromResp) != null) return String(fromResp);
+  // 回應裡沒有編號：查這位顧客的消費，從最新的開始找帶有暫時標記的那一筆
+  let list = [];
+  try { const r = await crm('GET', `orders?customerNo=${encodeURIComponent(customerNo)}&page=1&pageSize=50`); list = Array.isArray(r) ? r : (r?.data ?? r?.Data ?? []); } catch { }
+  if (!Array.isArray(list) || !list.length) {
+    try { const r = await crm('POST', 'orders/search', { CustomerType: 'PersonAccount', CustomerNo: customerNo, Page: 1 }); list = Array.isArray(r) ? r : (r?.data ?? r?.Data ?? []); } catch { }
+  }
+  const nos = (Array.isArray(list) ? list : []).filter(o => custNoOf(o) === customerNo).map(orderKey).filter(Boolean)
+    .sort((a, b) => (orderNum(b) ?? 0) - (orderNum(a) ?? 0)).slice(0, 8);
+  for (const no of nos) {
+    const o = await getOrderDetail(no);
+    if (o && extOf(o).優惠碼 === marker) return String(no);
+  }
+  throw new Error('建立優惠券消費後，找不到 CRM 給的消費編號');
+}
+
+// 寫入（覆蓋）優惠券消費：同一個消費編號再送一次＝更新（LINE 綁定 Apps Script 實測可用的方式）
+async function writeCouponOrder(c) {
+  await crm('POST', 'orders', {
+    OrderNo: c.orderNo, CustomerType: 'PersonAccount', CustomerNo: c.customerNo,
+    OrderDate: fmtDay(parseDay(c.issuedAt) ?? todayDay()),
+    Products: couponProducts(c.coupon),
+    ExtendedField: { 表單名稱: COUPON_FORM_NAME, 優惠碼: c.code, 優惠券名稱: c.coupon, 優惠券狀態: c.status, 有效期限: c.expire, 發送時間: c.issuedAt, 核銷時間: c.usedAt },
+  });
+}
+
+async function getCouponByCode(code, tail) {
+  const orderNo = orderNoFromCode(tail);
+  if (!orderNo) return null;                    // 驗證碼不對：打錯或偽造
+  const o = await getOrderDetail(orderNo);
+  if (!o) return null;
+  const e = extOf(o);
+  if (e.表單名稱 !== COUPON_FORM_NAME || String(e.優惠碼 || '').toUpperCase() !== code) return null;
+  return { orderNo, code, customerNo: custNoOf(o), coupon: e.優惠券名稱 || '', status: e.優惠券狀態 || '未使用', expire: e.有效期限 || '', issuedAt: e.發送時間 || '', usedAt: e.核銷時間 || '' };
+}
+const CODE_RE = new RegExp(`${COUPON_PREFIX}\\s*[-－]?\\s*([A-Z0-9]{4,12})`, 'i');
 
 async function handleRedeem(body) {
   const text = String(body?.text ?? body?.code ?? '').normalize('NFKC');
   const m = text.match(CODE_RE);
-  if (!m) return { status: 'invalid', message: `請輸入優惠碼，例如：核銷 ${COUPON_PREFIX}-AB12CD` };
-  const code = `${COUPON_PREFIX}-${m[1].toUpperCase()}`;
+  if (!m) return { status: 'invalid', message: `請輸入優惠碼，例如：核銷 ${COUPON_PREFIX}-AB3KQ` };
+  const tail = m[1].toUpperCase();
+  const code = `${COUPON_PREFIX}-${tail}`;
   const wantRedeem = /核銷|使用|兌換|用掉/.test(text);
+  try { await loadSnapshot(); } catch { /* 讀不到顧客資料就只顯示客戶編號 */ }
   return serial(async () => {
-    const c = await getCouponOrder(code);
+    const c = await getCouponByCode(code, tail);
     if (!c) return { status: 'not_found', message: `❌ 查無優惠碼 ${code}，請確認有沒有打錯。` };
     const who = (snapshot?.profiles || []).find(p => p.id === c.customerNo);
     const head = `🎟️ ${code}｜${c.coupon}\n👤 ${who ? who.姓名 : c.customerNo}${who?.寵物名 ? `（${who.寵物名}）` : ''}\n📅 有效期限：${c.expire}`;
@@ -737,9 +795,9 @@ async function handleRedeem(body) {
     if (expired) return { status: 'expired', message: `${head}\n\n⚠️ 這張券已過期，不能使用。` };
     if (!wantRedeem) return { status: 'valid', message: `${head}\n\n✅ 可以使用。要核銷請輸入「核銷 ${code}」` };
     const usedAt = nowTaipei();
-    await saveCouponOrder({ ...c, status: '已使用', usedAt });
+    await writeCouponOrder({ ...c, status: '已使用', usedAt });
     try {
-      await crm('POST', 'notes', { CustomerNo: c.customerNo, Content: `**✅ 優惠券已核銷 ${code}｜${c.coupon}**\n- 核銷時間：${usedAt}\n- 來源：老闆助手（iota C.ai）`, IsPublic: false, IsMarkdown: true });
+      await crm('POST', 'notes', { CustomerNo: c.customerNo, Content: `**✅ 優惠券已核銷 ${code}｜${c.coupon}**\n- 核銷時間：${usedAt}\n- 對應消費：${c.orderNo}\n- 來源：老闆助手（iota C.ai）`, IsPublic: false, IsMarkdown: true });
     } catch (e) { console.warn('[warn-redeem-note]', e.message); }
     return { status: 'redeemed', message: `${head}\n\n✅ 核銷成功（${usedAt}）` };
   });
