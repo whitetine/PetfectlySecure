@@ -12,7 +12,7 @@ const crypto = require('crypto');
 const owner = require('./owner');   // v10：老闆身分（綁定碼 + 管理頁）
 const assistant = require('./assistant');   // v11：老闆 AI 助手（自由問答）
 
-const VERSION = 'v12-ai-router';        // 首頁會顯示，用來確認 Render 跑的是哪一版
+const VERSION = 'v13-boss-only';         // 首頁會顯示，用來確認 Render 跑的是哪一版
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';       // 網址 ?token= 要一致
 const BIZFORM_TOKEN = process.env.BIZFORM_TOKEN || '';       // 選填：BizForm 標頭 x-bizform-token 的值
