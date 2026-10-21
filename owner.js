@@ -1,7 +1,8 @@
 // owner.js — 老闆（管理員）身分：Google 登入管理頁產生綁定碼 → LINE 輸入綁定碼 → 設為老闆
 //
 // 給 iota C.ai 呼叫（需帶 x-api-token 或 ?token=，跟 index.js 的 API_TOKEN 相同）：
-//   POST /api/role   {"userId":"Uxxx"}                    → {"role":"owner"|"customer"}
+//   POST /api/role   {"userId":"Uxxx","text":"使用者這句話"} → {"role":"owner"|"customer"}
+//                    這句話是綁定碼時會直接完成綁定，另外回傳 {"bind":"ok|invalid|...","message":"..."}
 //   POST /api/bind   {"userId":"Uxxx","text":"綁定 ABCD-EFGH"} → {"status":"ok"|"invalid"|"locked"|"error","message":"..."}
 //
 // 管理頁（用 Google 帳號登入，只有 ADMIN_EMAILS 裡的 email 能用；每個 API 都驗證 Google 簽發的 ID token）：
@@ -143,7 +144,7 @@ async function handleBind(body) {
   }
   c.usedBy = userId; c.usedAt = Date.now();   // 先作廢，確保只能用一次
 
-  if (await isOwner(userId)) { c.usedName = '（原本就是管理員）'; return { status: 'ok', role: 'owner', message: '你已經是管理員了，不需要再綁定。' }; }
+  if (await isOwner(userId)) { c.usedName = '（原本就是管理員）'; return { status: 'ok', role: 'owner', message: '✅ 你已經是管理員了，這組綁定碼不需要使用，已自動作廢。' }; }
 
   const name = await lineName(userId);
   c.usedName = name;
@@ -162,6 +163,22 @@ async function handleBind(body) {
   await setRichMenu(userId, true);
   notifyOwners(`🔔 新管理員已綁定：${name}（${twTime()}，由 ${c.email} 產生的綁定碼）\n如果不是你們授權的，請立刻到管理頁移除。`, userId);
   return { status: 'ok', role: 'owner', message: `✅ 綁定成功！${name} 已設為管理員。\n請再傳一則訊息，就會進入老闆模式。` };
+}
+
+// 身分判斷；如果這句話本身就是綁定碼（ABCD-EFGH，或「綁定 ABCDEFGH」），直接完成綁定，
+// 不管是老闆還是顧客、有沒有先傳「綁定」都一樣
+const BIND_TEXT_RE = new RegExp(`^(綁定)?\\s*([${CODE_CHARS}]{4})\\s*([-－])?\\s*([${CODE_CHARS}]{4})$`);
+async function handleRole(body) {
+  const userId = String(body?.userId || '').trim();
+  const text = String(body?.text || '').normalize('NFKC').trim().toUpperCase();
+  const m = text.match(BIND_TEXT_RE);
+  if (m && (m[1] || m[3])) {
+    const r = await handleBind({ userId, text });
+    return { role: (await isOwner(userId)) ? 'owner' : 'customer', bind: r.status, message: r.message };
+  }
+  const own = await isOwner(userId);
+  if (own && text === '綁定') return { role: 'owner', bind: 'already', message: '你已經是管理員了，不需要再綁定。' };
+  return { role: own ? 'owner' : 'customer' };
 }
 
 // ---------- Google ID token 驗證 ----------
@@ -206,7 +223,7 @@ async function ownerRows() {
   const o = await loadOwners(true);
   for (const [id, v] of Object.entries(o)) {
     if (BOOT_OWNERS.includes(id)) continue;
-    rows.push({ id, short: mask(id), name: v.name, boundAt: v.boundAt ? twTime(Date.parse(v.boundAt)) : '', boundBy: v.boundBy || '', removable: true });
+    rows.push({ id, short: KV_ON ? mask(id) : id, name: v.name, boundAt: v.boundAt ? twTime(Date.parse(v.boundAt)) : '', boundBy: v.boundBy || '', removable: true });
   }
   return rows;
 }
@@ -269,13 +286,14 @@ async function loadOwners(){
     const row=el('div','row');const info=el('div');
     info.append(el('div',null,o.name),el('div','muted',o.short+(o.boundAt?'｜'+o.boundAt:'')+(o.boundBy?'｜'+o.boundBy:'')));
     row.append(info);
+    if(o.removable&&!j.persistent){const cp=el('button','ghost','複製 ID');cp.style.color='var(--brand)';cp.onclick=async()=>{await navigator.clipboard.writeText(o.id);cp.textContent='已複製'};row.append(cp);}
     if(o.removable){const b=el('button','ghost','移除');b.onclick=async()=>{
       if(!confirm('確定要移除「'+o.name+'」的管理員身分?'))return;
       const j=await api('/admin/api/remove',{method:'POST',body:JSON.stringify({userId:o.id})});if(!j.ok)alert(j.message);loadOwners();};row.append(b);}
     box.append(row);
   }
   document.getElementById('kvwarn').innerHTML='';
-  if(!j.persistent)document.getElementById('kvwarn').append(el('p','warn','⚠️ 尚未設定 Cloudflare KV,伺服器重啟後綁定會消失。'));
+  if(!j.persistent)document.getElementById('kvwarn').append(el('p','warn','⚠️ 尚未設定 Cloudflare KV,伺服器重啟或休眠後,這裡綁定的管理員會消失。請按「複製 ID」,把 ID 加到 Render 的環境變數 OWNER_LINE_IDS(多個用逗號分隔),就會永久保存。'));
 }
 document.getElementById('gen').onclick=async()=>{
   const j=await api('/admin/api/code',{method:'POST'});
@@ -299,7 +317,7 @@ async function handle(req, res, url) {
   if (req.method === 'POST' && (path === '/api/role' || path === '/api/bind')) {
     if (!apiAuthed(req, url)) { json(res, 401, { status: 'error', message: 'bad token' }); return true; }
     let body; try { body = await readJson(req); } catch { json(res, 400, { status: 'error', message: '請求格式錯誤' }); return true; }
-    if (path === '/api/role') { const own = await isOwner(body.userId); json(res, 200, { role: own ? 'owner' : 'customer' }); return true; }
+    if (path === '/api/role') { json(res, 200, await handleRole(body)); return true; }
     json(res, 200, await handleBind(body));
     return true;
   }
