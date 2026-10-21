@@ -93,5 +93,91 @@ async function ask({ userId, question, context }) {
   }
 }
 
+// =====================================================================
+// 意圖判斷：由 LLM 決定老闆這句話要走哪個流程（取代 iota 的「包含某些字」規則）
+// 用 Ollama structured outputs 限定只能回清單裡的意圖，模型無法亂編。
+// =====================================================================
+const INTENTS = {
+  add_product: '老闆要「開始」新增／上架一個商品（不是在問怎麼做）',
+  find_customers: '篩選、找出、列出某一群顧客，或要發優惠券給某些顧客',
+  redeem_coupon: '要核銷或查詢某一張優惠券，句子裡通常有優惠碼',
+  booking: '要預約美容服務',
+  price_list: '要看價目表、價格表',
+  order_history: '要查預約或消費紀錄',
+  cancel_booking: '要取消某一筆預約',
+  feedback: '要留下意見回饋',
+  help: '問這套 LINE 系統怎麼操作、某個步驟什麼意思、為什麼出錯',
+  chat: '其他問題：經營、行銷、文案、寵物美容知識、閒聊',
+};
+const ROUTE_EXAMPLES = [
+  ['新增商品', 'add_product'], ['我要上架一款新的洗毛精', 'add_product'], ['加入商品', 'add_product'],
+  ['怎麼新增商品圖片', 'help'], ['商品照片要怎麼傳', 'help'], ['新增商品的格式是什麼', 'help'],
+  ['找出半年沒來的狗狗', 'find_customers'], ['消費最高的前10位', 'find_customers'], ['發優惠券給很久沒來的客人', 'find_customers'], ['請告訴我消費金額最高的顧客', 'find_customers'],
+  ['核銷 PS-AB3KQXY', 'redeem_coupon'], ['這張券還能用嗎 PS-K7Q2M9X', 'redeem_coupon'],
+  ['優惠券要怎麼核銷', 'help'], ['為什麼照片無法儲存', 'help'], ['綁定碼在哪裡', 'help'],
+  ['我要預約', 'booking'], ['幫我約下週六洗澡', 'booking'], ['價目表', 'price_list'], ['剪毛多少錢', 'price_list'],
+  ['查詢紀錄', 'order_history'], ['取消預約', 'cancel_booking'], ['我想給一些建議', 'feedback'],
+  ['幫我想一句中秋節的優惠文案', 'chat'], ['夏天狗狗多久洗一次澡比較好', 'chat'], ['上個月營收多少', 'chat'],
+];
+const COUPON_CODE_RE = /\bPS\s*[-－]?\s*[A-Z0-9]{4,12}\b/i;
+
+// Ollama 連不上時的備案：用簡單規則判斷，至少讓主要功能能用
+function fallbackRoute(t) {
+  const asking = /[?？]|怎麼|怎樣|什麼|甚麼|如何|為什麼|為何|哪裡|請問|教我/.test(t);
+  if (COUPON_CODE_RE.test(t) && !/怎麼|如何|為什麼|為何/.test(t)) return 'redeem_coupon';
+  if (asking) return 'help';
+  if (/新增商品|加入商品|上架/.test(t)) return 'add_product';
+  if (/取消/.test(t) && /預約/.test(t)) return 'cancel_booking';
+  if (/預約/.test(t)) return 'booking';
+  if (/價目|價格表/.test(t)) return 'price_list';
+  if (/查詢紀錄|預約紀錄|消費紀錄/.test(t)) return 'order_history';
+  if (/意見|回饋/.test(t)) return 'feedback';
+  if (/顧客|客人|名單|優惠券|沒來|消費/.test(t)) return 'find_customers';
+  return 'chat';
+}
+
+async function route({ text }) {
+  const t = String(text || '').normalize('NFKC').trim().slice(0, MAX_QUESTION);
+  if (!t) return { intent: 'chat', via: 'rule' };
+  // 有優惠碼、又不是在發問 → 一定是核銷，不用問 LLM（省時間）
+  if (COUPON_CODE_RE.test(t) && !/怎麼|如何|為什麼|為何/.test(t)) return { intent: 'redeem_coupon', via: 'rule' };
+  if (!OLLAMA_URL) return { intent: fallbackRoute(t), via: 'fallback' };
+  const system = [
+    `你是「${SHOP_NAME}」寵物美容店 LINE 系統的分流員。老闆傳來一句話，你要判斷他想做哪一件事。`,
+    '只能從下面的意圖選一個：',
+    ...Object.entries(INTENTS).map(([k, v]) => `- ${k}：${v}`),
+    '',
+    '判斷重點：',
+    '- 「怎麼、如何、什麼意思、為什麼、在哪裡」這類在問做法或原因的句子，一律是 help，就算句子裡有「新增商品」「預約」「核銷」這些字也一樣。',
+    '- 只有老闆真的要「現在開始做」某件事時，才選那件事的意圖。',
+    '',
+    '範例：',
+    ...ROUTE_EXAMPLES.map(([q, a]) => `老闆：${q} → ${a}`),
+  ].join('\n');
+  try {
+    const r = await fetch(`${OLLAMA_URL}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+      body: JSON.stringify({
+        model: OLLAMA_MODEL,
+        messages: [{ role: 'system', content: system }, { role: 'user', content: t }],
+        format: { type: 'object', properties: { intent: { type: 'string', enum: Object.keys(INTENTS) } }, required: ['intent'] },
+        stream: false, think: false,
+        options: { temperature: 0, num_predict: 60 },
+      }),
+      signal: AbortSignal.timeout(40000),
+    });
+    if (!r.ok) throw new Error(`Ollama ${r.status}`);
+    const j = await r.json();
+    const raw = clean(j?.message?.content);
+    const intent = JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1))?.intent;
+    if (!INTENTS[intent]) throw new Error('意圖不在清單裡：' + raw.slice(0, 80));
+    return { intent, via: 'llm' };
+  } catch (e) {
+    console.warn('[assistant] 意圖判斷失敗，改用規則', e.message);
+    return { intent: fallbackRoute(t), via: 'fallback' };
+  }
+}
+
 console.log('[assistant] AI 助手：', OLLAMA_URL ? `${OLLAMA_MODEL} @ ${OLLAMA_URL}` : '未設定 OLLAMA_URL（只會回覆指令清單）', '｜使用說明：', guide ? `${guide.length} 字` : '沒有');
-module.exports = { ask };
+module.exports = { ask, route };
