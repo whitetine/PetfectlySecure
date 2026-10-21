@@ -49,6 +49,8 @@ function systemPrompt(context) {
     '- 說明書沒寫的系統功能，不要自己編造；直接說目前系統沒有這個功能，或請老闆聯絡負責設定系統的人。',
     '- 老闆想做某件事時，告訴他要輸入哪一句指令（用「」框起來），不要假裝你已經幫他做了。',
     '- 你看不到任何顧客資料、訂單或營收。被問到具體數字時，說明要用哪個指令查詢。',
+    '- 老闆帳號不能使用預約、價目表、查詢紀錄、取消預約、意見回饋這些顧客功能，不要教老闆用這些。',
+    '- 綁定碼由系統自動處理，老闆直接把綁定碼傳到 LINE 就會完成綁定，不需要再到管理頁輸入。',
     '- 不要提到你是哪個 AI 模型，也不要輸出思考過程。',
     context ? `\n老闆目前正在操作：${context}。如果他的問題跟這個步驟有關，回答完再提醒他接下來要做什麼。` : '',
     '',
@@ -101,11 +103,7 @@ const INTENTS = {
   add_product: '老闆要「開始」新增／上架一個商品（不是在問怎麼做）',
   find_customers: '篩選、找出、列出某一群顧客，或要發優惠券給某些顧客',
   redeem_coupon: '要核銷或查詢某一張優惠券，句子裡通常有優惠碼',
-  booking: '要預約美容服務',
-  price_list: '要看價目表、價格表',
-  order_history: '要查預約或消費紀錄',
-  cancel_booking: '要取消某一筆預約',
-  feedback: '要留下意見回饋',
+  customer_only: '想使用顧客的功能：預約、看價目表、查預約紀錄、取消預約、意見回饋（老闆帳號不能用這些）',
   help: '問這套 LINE 系統怎麼操作、某個步驟什麼意思、為什麼出錯',
   chat: '其他問題：經營、行銷、文案、寵物美容知識、閒聊',
 };
@@ -115,8 +113,9 @@ const ROUTE_EXAMPLES = [
   ['找出半年沒來的狗狗', 'find_customers'], ['消費最高的前10位', 'find_customers'], ['發優惠券給很久沒來的客人', 'find_customers'], ['請告訴我消費金額最高的顧客', 'find_customers'],
   ['核銷 PS-AB3KQXY', 'redeem_coupon'], ['這張券還能用嗎 PS-K7Q2M9X', 'redeem_coupon'],
   ['優惠券要怎麼核銷', 'help'], ['為什麼照片無法儲存', 'help'], ['綁定碼在哪裡', 'help'],
-  ['我要預約', 'booking'], ['幫我約下週六洗澡', 'booking'], ['價目表', 'price_list'], ['剪毛多少錢', 'price_list'],
-  ['查詢紀錄', 'order_history'], ['取消預約', 'cancel_booking'], ['我想給一些建議', 'feedback'],
+  ['我要預約', 'customer_only'], ['幫我約下週六洗澡', 'customer_only'], ['價目表', 'customer_only'],
+  ['查詢紀錄', 'customer_only'], ['取消預約', 'customer_only'], ['意見回饋', 'customer_only'],
+  ['顧客要怎麼預約', 'help'], ['剪毛的價格要去哪裡改', 'help'],
   ['幫我想一句中秋節的優惠文案', 'chat'], ['夏天狗狗多久洗一次澡比較好', 'chat'], ['上個月營收多少', 'chat'],
 ];
 const COUPON_CODE_RE = /\bPS\s*[-－]?\s*[A-Z0-9]{4,12}\b/i;
@@ -127,16 +126,16 @@ function fallbackRoute(t) {
   if (COUPON_CODE_RE.test(t) && !/怎麼|如何|為什麼|為何/.test(t)) return 'redeem_coupon';
   if (asking) return 'help';
   if (/新增商品|加入商品|上架/.test(t)) return 'add_product';
-  if (/取消/.test(t) && /預約/.test(t)) return 'cancel_booking';
-  if (/預約/.test(t)) return 'booking';
-  if (/價目|價格表/.test(t)) return 'price_list';
-  if (/查詢紀錄|預約紀錄|消費紀錄/.test(t)) return 'order_history';
-  if (/意見|回饋/.test(t)) return 'feedback';
+  if (/預約|價目|價格表|查詢紀錄|消費紀錄|意見回饋/.test(t)) return 'customer_only';
   if (/顧客|客人|名單|優惠券|沒來|消費/.test(t)) return 'find_customers';
   return 'chat';
 }
 
-async function route({ text }) {
+const CUSTOMER_ONLY_MSG = '這是顧客使用的功能（預約、價目表、查詢紀錄、取消預約、意見回饋），老闆帳號不能使用喔。\n\n要測試顧客的流程，請用另一個沒有綁定老闆的 LINE 帳號。';
+const withTag = (r) => ({ ...r, tag: `#${r.intent}#`, ...(r.intent === 'customer_only' ? { message: CUSTOMER_ONLY_MSG } : {}) });
+
+async function route(args) { return withTag(await routeRaw(args)); }
+async function routeRaw({ text }) {
   const t = String(text || '').normalize('NFKC').trim().slice(0, MAX_QUESTION);
   if (!t) return { intent: 'chat', via: 'rule' };
   // 有優惠碼、又不是在發問 → 一定是核銷，不用問 LLM（省時間）
