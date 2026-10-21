@@ -12,7 +12,7 @@ const crypto = require('crypto');
 const owner = require('./owner');   // v10：老闆身分（綁定碼 + 管理頁）
 const assistant = require('./assistant');   // v11：老闆 AI 助手（自由問答）
 
-const VERSION = 'v11-ai-assistant';     // 首頁會顯示，用來確認 Render 跑的是哪一版
+const VERSION = 'v12-ai-router';        // 首頁會顯示，用來確認 Render 跑的是哪一版
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';       // 網址 ?token= 要一致
 const BIZFORM_TOKEN = process.env.BIZFORM_TOKEN || '';       // 選填：BizForm 標頭 x-bizform-token 的值
@@ -1004,13 +1004,14 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ---- v7 老闆助手 API ----
-  if (req.method === 'POST' && ['/api/segment', '/api/coupon/send', '/api/coupon/redeem', '/api/help'].includes(url.pathname)) {
+  if (req.method === 'POST' && ['/api/segment', '/api/coupon/send', '/api/coupon/redeem', '/api/help', '/api/route'].includes(url.pathname)) {
     if (!apiAuthed(req, url)) return send(res, 401, { status: 'error', message: 'bad token' });
     let body; try { body = await readJson(req); } catch { return sendCompact(res, { status: 'error', message: '請求格式錯誤' }); }
     if (OWNER_CHECK && !(await owner.isOwner(body?.userId))) {
       console.warn('[owner] 非管理員呼叫老闆功能', url.pathname);
       return sendCompact(res, { status: 'forbidden', message: '這個功能只有管理員可以使用。' });
     }
+    if (url.pathname === '/api/route') { const r = await assistant.route({ text: body.text }); console.log('[route]', r.intent, r.via); return sendCompact(res, r); }
     if (url.pathname === '/api/help') return sendCompact(res, { status: 'answer', message: await assistant.ask({ userId: body.userId, question: body.question, context: body.context }) });
     try { return sendCompact(res, url.pathname === '/api/segment' ? await handleSegment(body) : url.pathname === '/api/coupon/redeem' ? await handleRedeem(body) : await handleSend(body)); }
     catch (e) { console.error('[error-api]', e.message); return sendCompact(res, { status: 'error', message: '系統暫時讀不到 CRM 資料，請稍後再試。' }); }
