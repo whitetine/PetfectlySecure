@@ -12,7 +12,7 @@ const crypto = require('crypto');
 const owner = require('./owner');   // v10：老闆身分（綁定碼 + 管理頁）
 const assistant = require('./assistant');   // v14：老闆智慧客服（GPT + 查資料工具）；優惠券篩選仍用地端 Ollama（在 iota 呼叫）
 
-const VERSION = 'v14-gpt-boss';          // 首頁會顯示，用來確認 Render 跑的是哪一版
+const VERSION = 'v15-one-card';           // 首頁會顯示，用來確認 Render 跑的是哪一版
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';       // 網址 ?token= 要一致
 const BIZFORM_TOKEN = process.env.BIZFORM_TOKEN || '';       // 選填：BizForm 標頭 x-bizform-token 的值
@@ -591,6 +591,30 @@ function profileLine(p, i) {
   return `${i + 1}. ${p.姓名}${pet ? '｜' + pet : ''}｜${last}｜來 ${p.來訪次數} 次｜${money(p.總消費)}`;
 }
 
+// 名單＋發券按鈕放在同一張卡片：每一輪只送一則訊息（第二則訊息在 LINE 上可能發不出去）
+function segmentFlex(head, list, coupon) {
+  const shown = list.slice(0, LIST_SHOW_MAX).map((p, i) => profileLine(p, i));
+  if (list.length > LIST_SHOW_MAX) shown.push(`…其餘 ${list.length - LIST_SHOW_MAX} 位未列出（選「確認發送」會一起發）`);
+  const t = (text, o = {}) => ({ type: 'text', text: String(text).slice(0, 2000) || ' ', wrap: true, size: 'sm', color: '#333333', ...o });
+  const btn = (label, text, primary) => ({ type: 'button', style: primary ? 'primary' : 'secondary', color: primary ? BRAND : undefined, height: 'sm', margin: 'sm', action: { type: 'message', label, text } });
+  return {
+    type: 'bubble', size: 'giga',
+    body: { type: 'box', layout: 'vertical', spacing: 'sm', contents: [
+      t('🎯 目標顧客篩選完成', { weight: 'bold', size: 'md', color: '#111111' }),
+      t(head.join('\n'), { size: 'xs', color: '#666666' }),
+      t(`👤 符合 ${list.length} 位顧客`, { weight: 'bold' }),
+      { type: 'separator', margin: 'md' },
+      t(shown.join('\n'), { size: 'xs', margin: 'md' }),
+      { type: 'separator', margin: 'md' },
+      t(`🎟️ 優惠券：${coupon}`, { weight: 'bold', margin: 'md' }),
+      t('要發送嗎？按下面的按鈕，或輸入編號（例如 1,3,5、1-5、全部，排除 2）', { size: 'xs', color: '#888888' }),
+    ] },
+    footer: { type: 'box', layout: 'vertical', spacing: 'none', contents: [
+      btn('確認發送', '全部發送', true), btn('選擇部分', '選擇部分'), btn('取消發送', '取消發送優惠券'),
+    ] },
+  };
+}
+
 async function handleSegment(body) {
   // 不是篩選顧客的問題（或篩選 AI 沒看懂）→ 有原始問題就交給 AI 助手自由回答
   if ((body?.error || body?.intent === 'other') && String(body?.question || '').trim()) {
@@ -627,7 +651,7 @@ async function handleSegment(body) {
   list.slice(0, LIST_SHOW_MAX).forEach((p, i) => lines.push(profileLine(p, i)));
   if (list.length > LIST_SHOW_MAX) lines.push(`…其餘 ${list.length - LIST_SHOW_MAX} 位未列出（選「全部發送」會一起發）`);
   lines.push('', `🎟️ 優惠券：${coupon}`, '', '要發送嗎？請回覆：', '•「全部發送」', '• 編號，例如「1,3,5」或「1-5」', '•「全部，排除 2」', '•「取消」');
-  return { status: 'ok', segmentId, count: list.length, message: lines.join('\n') };
+  return { status: 'ok', segmentId, count: list.length, message: lines.join('\n'), flex: JSON.stringify(segmentFlex(head, list, coupon)) };
 }
 
 // ---- 實際發券：每張券一組專屬優惠碼；有綁 LINE 的顧客推播「優惠券卡片」，每位顧客都在 CRM 留一則記事 ----
@@ -1066,6 +1090,24 @@ const server = http.createServer(async (req, res) => {
     if (!apiAuthed(req, url)) return send(res, 401, { error: 'bad token' });
     try { return send(res, 200, await seedTestData(url.searchParams.get('dry') !== '0')); }
     catch (e) { return send(res, 500, { error: e.message }); }
+  }
+
+  // 查 LINE 官方帳號本月訊息額度（推播／群發會扣額度，回覆不會）
+  if (req.method === 'GET' && url.pathname === '/api/line-quota') {
+    if (!apiAuthed(req, url)) return send(res, 401, { error: 'bad token' });
+    if (!LINE_TOKEN) return send(res, 200, { error: '沒有設定 LINE_CHANNEL_ACCESS_TOKEN' });
+    const get = async (p) => { const r = await fetch(`${LINE_API_BASE}${p}`, { headers: { Authorization: `Bearer ${LINE_TOKEN}` }, signal: AbortSignal.timeout(10000) }); return r.ok ? r.json() : { error: `LINE ${r.status}` }; };
+    try {
+      const [quota, used] = await Promise.all([get('/v2/bot/message/quota'), get('/v2/bot/message/quota/consumption')]);
+      const limit = quota?.type === 'limited' ? quota.value : null;
+      const n = used?.totalUsage;
+      return send(res, 200, {
+        本月額度: limit ?? (quota?.type === 'none' ? '無上限' : quota),
+        本月已使用: n ?? used,
+        剩餘: limit != null && n != null ? Math.max(0, limit - n) : null,
+        結論: limit != null && n != null && n >= limit ? '❌ 本月額度已用完：推播與第二則以後的訊息會發不出去' : '✅ 還有額度',
+      });
+    } catch (e) { return send(res, 500, { error: e.message }); }
   }
 
   if (req.method === 'GET' && url.pathname === '/api/status') {
