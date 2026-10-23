@@ -10,9 +10,9 @@
 const http = require('http');
 const crypto = require('crypto');
 const owner = require('./owner');   // v10：老闆身分（綁定碼 + 管理頁）
-const assistant = require('./assistant');   // v11：老闆 AI 助手（自由問答）
+const assistant = require('./assistant');   // v14：老闆智慧客服（GPT + 查資料工具）；優惠券篩選仍用地端 Ollama（在 iota 呼叫）
 
-const VERSION = 'v13-boss-only';         // 首頁會顯示，用來確認 Render 跑的是哪一版
+const VERSION = 'v14-gpt-boss';          // 首頁會顯示，用來確認 Render 跑的是哪一版
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';       // 網址 ?token= 要一致
 const BIZFORM_TOKEN = process.env.BIZFORM_TOKEN || '';       // 選填：BizForm 標頭 x-bizform-token 的值
@@ -392,7 +392,7 @@ function buildProfiles(customers, orders) {
   return customers.map((c) => {
     const no = custNoOf(c), ce = extOf(c);
     const counts = { 洗澡: 0, 剪毛: 0, 大美容: 0, 小美容: 0, 其他: 0 };
-    const visits = []; let upcoming = false; let latest = null;
+    const visits = []; const upcomingList = []; let upcoming = false; let latest = null;
 
     for (const o of byCust.get(no) || []) {
       const oe = extOf(o);
@@ -400,21 +400,23 @@ function buildProfiles(customers, orders) {
       // 預約日：優先用「預約時段」（例如 2026-10-18 16:00），沒有才用來訪日期、訂單日期
       const day = parseDay(oe['預約時段']) ?? parseDay(o['預約時段']) ?? parseDay(oe['來訪日期']) ?? parseDay(o.OrderDate ?? o.orderDate);
       if (day == null) continue;
-      if (day > today) { upcoming = true; continue; }          // 未來的日期 = 已預約、還沒來
       const items = o.Products || o.products || o.OrderItems || o.Items || [];
+      const itemNames = items.map(p => String(p.ProductName ?? p.productName ?? p.Name ?? '')).filter(Boolean);
+      if (day > today) { upcoming = true; upcomingList.push({ day, time: String(oe['預約時段'] ?? ''), items: itemNames }); continue; }   // 未來的日期 = 已預約、還沒來
       let sum = 0, isService = false;
+      const svcItems = [];
       for (const p of items) {
         const name = String(p.ProductName ?? p.productName ?? p.Name ?? '');
         const qty = Number(p.Quantity ?? p.quantity ?? 1) || 1;
         const price = Number(p.UnitPrice ?? p.unitPrice ?? p.Price ?? 0) || 0;
         sum += qty * price;
-        if (SERVICES.includes(name)) { counts[name] += qty; isService = true; }
-        else if (price > 0) { counts.其他 += qty; isService = true; }   // 契約等 0 元代表項目不算服務
+        if (SERVICES.includes(name)) { counts[name] += qty; isService = true; svcItems.push({ name, qty, price }); }
+        else if (price > 0) { counts.其他 += qty; isService = true; svcItems.push({ name, qty, price }); }   // 契約等 0 元代表項目不算服務
       }
       const total = Number(o.TotalAmount ?? o.OrderTotal ?? o.OrderAmount ?? o.Amount ?? o.Total ?? NaN);
       const amount = Number.isFinite(total) && total > 0 ? total : sum;
       if (!isService && amount <= 0) continue;                  // 純契約/資料表單不算一次來訪
-      visits.push({ day, amount });
+      visits.push({ day, amount, items: svcItems, pet: String(oe['寵物名'] ?? '') });
       if (!latest || day >= latest.day) latest = { day, ext: oe };
     }
 
@@ -460,8 +462,28 @@ function buildProfiles(customers, orders) {
       洗澡次數: counts.洗澡, 剪毛次數: counts.剪毛, 大美容次數: counts.大美容, 小美容次數: counts.小美容, 其他服務次數: counts.其他,
       lineId: lineIdOf(c),
       _source: source,
+      _phone: String(firstVal(isPhoneLike(c.CurrentName) ? c.CurrentName : undefined, ce['電話(甲方)']) || '').replace(/\D/g, ''),   // 只在伺服器比對用，不會給 AI
+      _visits: visits.sort((a, b) => b.day - a.day),
+      _upcoming: upcomingList.sort((a, b) => a.day - b.day),
     };
   });
+}
+
+// ---- 意見回饋：從「消費」裡找表單名稱符合的資料（需要 ORDERS=1，BizForm 回饋表單才會寫成消費）----
+const FEEDBACK_RE = new RegExp(process.env.FEEDBACK_FORM_KEYWORD || '回饋|意見|滿意');
+const FEEDBACK_SKIP = /身分證|居留證|電話|手機|地址|電子郵件|email|表單單號|原始表單|表單名稱|晶片/i;
+function buildFeedback(customers, orders) {
+  const nameOf = new Map(customers.map(c => { const ce = extOf(c); return [custNoOf(c), firstVal(ce['姓名'], isPhoneLike(c.CurrentName) ? undefined : c.CurrentName) || '（未填姓名）']; }));
+  const out = [];
+  for (const o of orders) {
+    const oe = extOf(o);
+    const form = String(oe['表單名稱'] ?? '');
+    if (!FEEDBACK_RE.test(form)) continue;
+    const fields = {};
+    for (const [k, v] of Object.entries(oe)) if (v != null && String(v).trim() && !FEEDBACK_SKIP.test(k)) fields[k] = String(v).slice(0, 300);
+    out.push({ day: parseDay(o.OrderDate ?? o.orderDate) ?? parseDay(oe['來訪日期']), form, 姓名: nameOf.get(custNoOf(o)) || '（未知顧客）', fields });
+  }
+  return out.sort((a, b) => (b.day ?? 0) - (a.day ?? 0));
 }
 
 let snapshot = null;
@@ -476,10 +498,13 @@ async function loadSnapshot(force = false) {
       warning = '讀不到消費/預約資料，暫時改用顧客欄位上的彙總資料';
       console.warn('[warn-orders]', e.message);
     }
-    snapshot = { at: Date.now(), customers: customers.length, orders: orders.length, warning, profiles: buildProfiles(customers, orders) };
+    const profiles = buildProfiles(customers, orders);
+    snapshot = { at: Date.now(), customers: customers.length, orders: orders.length, warning, profiles, feedback: buildFeedback(customers, orders) };
     return snapshot;
   });
 }
+
+assistant.useData({ loadSnapshot, todayDay, fmtDay, money, DAY });
 
 // ---- 條件驗證與篩選（白名單：AI 給錯欄位或運算子一律擋掉）----
 const FIELD_TYPES = {
@@ -601,7 +626,7 @@ async function handleSegment(body) {
   const lines = [...head, `👤 符合 ${list.length} 位顧客`, ''];
   list.slice(0, LIST_SHOW_MAX).forEach((p, i) => lines.push(profileLine(p, i)));
   if (list.length > LIST_SHOW_MAX) lines.push(`…其餘 ${list.length - LIST_SHOW_MAX} 位未列出（選「全部發送」會一起發）`);
-  lines.push('', `🎟️ 優惠券：${coupon}`);
+  lines.push('', `🎟️ 優惠券：${coupon}`, '', '要發送嗎？請回覆：', '•「全部發送」', '• 編號，例如「1,3,5」或「1-5」', '•「全部，排除 2」', '•「取消」');
   return { status: 'ok', segmentId, count: list.length, message: lines.join('\n') };
 }
 
